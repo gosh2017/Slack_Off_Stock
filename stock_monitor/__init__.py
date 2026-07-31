@@ -6,4 +6,4 @@ A 股实时行情查询工具
 
 from .gui import StockMonitorApp  # noqa: F401
 
-__version__ = "1.1.0"
+__version__ = "1.3.0"

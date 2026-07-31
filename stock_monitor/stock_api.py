@@ -8,21 +8,7 @@
 import requests
 import re
 
-# 新浪财经接口 URL（无需 API Key）
-SINA_API_URL = "https://hq.sinajs.cn/list="
-
-# 请求头，模拟浏览器访问
-HEADERS = {
-    "Referer": "https://finance.sina.com.cn",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-}
-
-# 请求超时时间（秒）
-TIMEOUT = 10
+from stock_monitor.config import HEADERS, TIMEOUT, SINA_BASE as SINA_API_URL
 
 # ──────────────── 已知指数代码映射（新浪接口所需前缀）───────────────
 # 部分指数不按普通前缀规则，需单独指定。

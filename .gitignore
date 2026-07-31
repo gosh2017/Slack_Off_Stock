@@ -144,3 +144,6 @@ cython_debug/
 *.swp
 *.swo
 *~
+# Program-generated query history
+stock_monitor/config/
+config/
