@@ -93,7 +93,7 @@ stock_monitor/
 ├── main.py              # 程序入口
 ├── gui.py               # GUI 界面（紧凑摸鱼版）
 ├── kline_chart.py       # K线图模块（matplotlib 绘制，支持嵌入和独立窗口）
-├── stock_api.py         # 数据获取模块（新浪财经 API + 东方财富 K线 API）
+├── stock_api.py         # 数据获取模块（新浪财经 API）
 ├── stock_search.py      # 名称搜索模块
 ├── history_manager.py   # 查询历史管理（JSON 持久化）
 ├── config.py            # 共享配置（请求头、超时等）
