@@ -14,6 +14,7 @@
 - ✅ **涨跌颜色** — 深红显示上涨，深绿显示下跌，低调不扎眼
 - ✅ **查询历史** — 底部表格记录查询过的股票，双击可快速重新查询，支持清空
 - ✅ **悬浮窗** — 独立小窗口置顶显示股价和涨跌幅，默认在桌面右下角，每 60 秒自动刷新，可拖拽移动
+- ✅ **K线图** — 底部「K线」标签页直接显示蜡烛图 + MA5/MA10/MA20 均线 + 成交量柱，支持切换日K/周K/月K，查询股票后自动加载
 - ✅ **开始/停止刷新** — 灵活控制自动刷新开关
 - ✅ **窗口置顶** — 可选置顶显示，方便盯盘
 - ✅ **后台线程** — 数据获取在后台执行，界面不卡顿
@@ -27,10 +28,11 @@
 ## 安装依赖
 
 ```bash
-pip install requests
+pip install requests matplotlib
 ```
 
 > `tkinter` 是 Python 标准库，通常无需额外安装。
+> `matplotlib` 仅用于 K线图功能，如果不需要可跳过安装。
 > 如果 Linux 下提示 `ModuleNotFoundError: No module named 'tkinter'`，请执行：
 > - Ubuntu/Debian：`sudo apt install python3-tk`
 > - CentOS/RHEL：`sudo yum install python3-tkinter`
@@ -58,9 +60,10 @@ python -m stock_monitor.main
 4. 或点击「名称搜索」按钮手动搜索
 5. 点击「开始刷新」按钮，程序将按设定间隔自动更新数据
 6. 点击「停止刷新」按钮可暂停自动更新
-7. 底部「查询历史」表格记录每次查询，**双击历史行**可快速重新查询
+7. 底部「历史」标签页记录每次查询，**双击历史行**可快速重新查询
 8. 点击「悬浮」按钮打开独立置顶悬浮窗，显示当前股价和涨跌幅，位于桌面右下角，每 60 秒自动刷新，可拖拽到任意位置
-9. 勾选「置顶」可使主窗口始终显示在最前面
+9. 切换到「K线」标签页，查看股票的历史走势（日K/周K/月K），支持切换周期和手动刷新
+10. 勾选「置顶」可使主窗口始终显示在最前面
 
 > 💡 **小技巧**：不确定股票代码时，直接输入名称拼音或简称（如"茅台"、"平安"）搜索即可。
 
@@ -81,7 +84,7 @@ python -m stock_monitor.main
 
 ## 数据来源
 
-本程序使用 **新浪财经免费接口**（`https://hq.sinajs.cn/list=`）获取实时行情数据，无需申请 API Key。
+本程序使用 **新浪财经免费接口**（`https://hq.sinajs.cn/list=`）获取实时行情数据，使用 **新浪财经 K线接口**（`https://quotes.sina.cn/cn/api/`）获取 K线数据，无需申请 API Key。
 
 ## 项目结构
 
@@ -89,7 +92,8 @@ python -m stock_monitor.main
 stock_monitor/
 ├── main.py              # 程序入口
 ├── gui.py               # GUI 界面（紧凑摸鱼版）
-├── stock_api.py         # 数据获取模块（新浪财经 API）
+├── kline_chart.py       # K线图模块（matplotlib 绘制，支持嵌入和独立窗口）
+├── stock_api.py         # 数据获取模块（新浪财经 API + 东方财富 K线 API）
 ├── stock_search.py      # 名称搜索模块
 ├── history_manager.py   # 查询历史管理（JSON 持久化）
 ├── config.py            # 共享配置（请求头、超时等）

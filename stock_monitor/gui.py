@@ -16,9 +16,21 @@ import threading
 import queue
 from datetime import datetime
 
-from stock_monitor.stock_api import query_stock
+from stock_monitor.stock_api import query_stock, query_kline_data
 from stock_monitor.stock_search import search_stocks
 from stock_monitor.history_manager import save_query, load_history, clear_history
+
+# ──────────────── 可选依赖：matplotlib（嵌入 K线图用） ────────────────
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+    MATPLOTLIB_OK = True
+except ImportError:
+    MATPLOTLIB_OK = False
 
 # ──────────────── 低调配色 ────────────────
 COLOR_UP = "#C00000"      # 涨 — 深红（不像荧光红那么刺眼）
@@ -29,6 +41,9 @@ COLOR_INFO = "#666666"    # 辅助文字
 COLOR_SEARCH_BG = "#FAFAFA"
 COLOR_TABLE_HEADER = "#D0D0D0"
 COLOR_TABLE_ROW = "#FFFFFF"
+COLOR_MA5 = "#FF8C00"     # MA5 — 橙色
+COLOR_MA10 = "#4169E1"    # MA10 — 蓝色
+COLOR_MA20 = "#8B008B"    # MA20 — 紫色
 
 # 字体：等宽数字更整齐
 FONT_MONO = ("Consolas", 10)
@@ -47,8 +62,9 @@ class StockMonitorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("行情")
-        self.root.geometry("400x500")
-        self.root.resizable(False, False)
+        self.root.geometry("480x640")
+        self.root.resizable(True, True)
+        self.root.minsize(400, 500)
         self.root.configure(bg=COLOR_BG)
 
         # 可选：窗口置顶
@@ -74,6 +90,11 @@ class StockMonitorApp:
         self._popup_window = None
         self._popup_refresh_timer = None
 
+        # K线图嵌入相关
+        self.kline_embed_data = []
+        self.kline_embed_period = "daily"
+        self._kline_loading = False
+
         self._build_ui()
         self._refresh_history_table()
         self._poll_queue()
@@ -85,7 +106,7 @@ class StockMonitorApp:
         self._build_search_results()
         self._build_info_table()
         self._build_control_area()
-        self._build_history_area()
+        self._build_bottom_area()
         self._build_status_bar()
 
     # ── 输入区 ──
@@ -244,22 +265,38 @@ class StockMonitorApp:
         )
         self.popup_btn.pack(side=tk.LEFT, padx=4)
 
-    # ── 历史表格 ──
+    # ── 底部区域（Notebook 切换历史 / K线） ──
 
-    def _build_history_area(self):
-        history_outer = tk.Frame(self.root, bg=COLOR_BG)
-        history_outer.pack(fill=tk.X, padx=12, pady=(2, 0))
+    def _build_bottom_area(self):
+        """底部 Notebook：历史记录 + K线图"""
+        self.bottom_notebook = ttk.Notebook(self.root)
+        self.bottom_notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(2, 0))
 
-        tk.Label(history_outer, text="查询历史（双击重查）：",
+        # ── Tab 1: 历史记录 ──
+        history_frame = tk.Frame(self.bottom_notebook, bg=COLOR_BG)
+        self.bottom_notebook.add(history_frame, text="历史")
+        self._build_history_tab(history_frame)
+
+        # ── Tab 2: K线图 ──
+        kline_frame = tk.Frame(self.bottom_notebook, bg=COLOR_BG)
+        self.bottom_notebook.add(kline_frame, text="K线")
+        self._build_kline_tab(kline_frame)
+
+        # 监听 tab 切换
+        self.bottom_notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _build_history_tab(self, parent):
+        """构建历史记录 tab"""
+        tk.Label(parent, text="查询历史（双击重查）：",
                  font=FONT_LABEL, bg=COLOR_BG, fg="#333"
-                 ).pack(side=tk.LEFT)
+                 ).pack(anchor=tk.W, padx=4, pady=(4, 0))
 
-        tk.Button(history_outer, text="清空", font=FONT_BTN,
+        tk.Button(parent, text="清空", font=FONT_BTN,
                   bg="#E0E0E0", fg="#333", command=self._on_clear_history
-                  ).pack(side=tk.RIGHT)
+                  ).pack(anchor=tk.E, padx=4, pady=(0, 2))
 
-        tree_frame = tk.Frame(history_outer, bg=COLOR_BG)
-        tree_frame.pack(fill=tk.X)
+        tree_frame = tk.Frame(parent, bg=COLOR_BG)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -267,7 +304,7 @@ class StockMonitorApp:
         columns = ("code", "type", "name", "price", "change", "time")
         self.history_tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings",
-            height=3, yscrollcommand=scrollbar.set,
+            height=5, yscrollcommand=scrollbar.set,
         )
         scrollbar.config(command=self.history_tree.yview)
 
@@ -283,8 +320,251 @@ class StockMonitorApp:
             self.history_tree.heading(col_id, text=heading)
             self.history_tree.column(col_id, width=width, anchor=anchor)
 
-        self.history_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.history_tree.bind("<Double-Button-1>", self._on_select_history)
+
+    # ── K线图嵌入 tab ──
+
+    def _build_kline_tab(self, parent):
+        """构建 K线图嵌入 tab"""
+        # 工具栏
+        kline_toolbar = tk.Frame(parent, bg=COLOR_BG)
+        kline_toolbar.pack(fill=tk.X, padx=4, pady=(4, 2))
+
+        self.kline_status_label = tk.Label(
+            kline_toolbar, text="", font=("微软雅黑", 8),
+            bg=COLOR_BG, fg="#888",
+        )
+        self.kline_status_label.pack(side=tk.LEFT, padx=2)
+
+        # 周期按钮
+        self.kline_period_btns = {}
+        btn_style = {"font": ("微软雅黑", 8), "width": 4,
+                     "bg": "#E0E0E0", "fg": "#333"}
+        for key, label in [("daily", "日K"), ("weekly", "周K"), ("monthly", "月K")]:
+            btn = tk.Button(
+                kline_toolbar, text=label, **btn_style,
+                command=lambda p=key: self._switch_kline_period(p),
+            )
+            btn.pack(side=tk.RIGHT, padx=1)
+            self.kline_period_btns[key] = btn
+
+        # 刷新按钮
+        self.kline_refresh_btn = tk.Button(
+            kline_toolbar, text="刷新", font=("微软雅黑", 8), width=4,
+            bg="#E0E0E0", fg="#333", command=self._refresh_kline_embed,
+        )
+        self.kline_refresh_btn.pack(side=tk.RIGHT, padx=4)
+
+        # 提示信息
+        self.kline_placeholder = tk.Label(
+            parent, text="", font=("微软雅黑", 9),
+            bg="white", fg="#AAA", anchor=tk.CENTER,
+        )
+        self.kline_placeholder.pack(fill=tk.BOTH, expand=True)
+
+        # matplotlib 图表容器
+        self.kline_fig = None
+        self.kline_canvas = None
+        self.kline_ax_price = None
+        self.kline_ax_volume = None
+
+        if not MATPLOTLIB_OK:
+            self.kline_placeholder.config(
+                text="请安装 matplotlib 以显示 K线图\n\npip install matplotlib")
+
+    def _init_kline_figure(self):
+        """初始化 matplotlib 图表（首次使用时调用）"""
+        if self.kline_fig is not None:
+            return
+        if not MATPLOTLIB_OK:
+            return
+
+        matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+
+        self.kline_fig = Figure(figsize=(5, 3), dpi=100, facecolor="white")
+        self.kline_fig.subplots_adjust(left=0.07, right=0.97, bottom=0.12,
+                                       top=0.95, hspace=0.10)
+
+        self.kline_ax_price = self.kline_fig.add_subplot(3, 1, (1, 2))
+        self.kline_ax_volume = self.kline_fig.add_subplot(3, 1, 3,
+                                                          sharex=self.kline_ax_price)
+
+        # 找到 K线 tab 的容器 frame
+        kline_frame = self.kline_placeholder.master
+        self.kline_placeholder.pack_forget()
+
+        self.kline_canvas = FigureCanvasTkAgg(self.kline_fig, master=kline_frame)
+        self.kline_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+    # ── K线图 tab 事件 ──
+
+    def _on_tab_changed(self, event=None):
+        """Notebook tab 切换事件"""
+        selected = self.bottom_notebook.select()
+        tab_text = self.bottom_notebook.tab(selected, "text")
+        if tab_text == "K线":
+            self._refresh_kline_embed()
+
+    def _switch_kline_period(self, period: str):
+        """切换 K线周期"""
+        if period == self.kline_embed_period or self._kline_loading:
+            return
+        self.kline_embed_period = period
+        self._refresh_kline_embed()
+
+    def _refresh_kline_embed(self):
+        """刷新嵌入的 K线图"""
+        if not self.current_code:
+            self.kline_status_label.config(text="请先查询股票")
+            return
+        if self._kline_loading:
+            return
+        if not MATPLOTLIB_OK:
+            return
+
+        self._init_kline_figure()
+        self._kline_loading = True
+        self.kline_status_label.config(text="加载中...")
+        self._set_kline_buttons_state(tk.DISABLED)
+
+        threading.Thread(target=self._fetch_kline_thread, daemon=True).start()
+
+    def _fetch_kline_thread(self):
+        """后台线程：获取 K线数据"""
+        count = 120
+        for key, label, c in [("daily", "日K", 120), ("weekly", "周K", 400),
+                               ("monthly", "月K", 800)]:
+            if key == self.kline_embed_period:
+                count = c
+                break
+        result = query_kline_data(
+            self.current_code, self.current_type,
+            period=self.kline_embed_period, count=count,
+        )
+        self.root.after(0, self._on_kline_data_ready, result)
+
+    def _on_kline_data_ready(self, result):
+        """K线数据就绪，更新图表"""
+        self._kline_loading = False
+        self._set_kline_buttons_state(tk.NORMAL)
+
+        if result["error"]:
+            self.kline_status_label.config(text="查询失败")
+            if self.kline_ax_price:
+                self.kline_ax_price.clear()
+                self.kline_ax_volume.clear()
+                self.kline_ax_price.text(0.5, 0.5, f"查询失败: {result['error']}",
+                                         transform=self.kline_ax_price.transAxes,
+                                         ha="center", va="center", fontsize=9, color="#888")
+                self.kline_canvas.draw()
+            return
+
+        self.kline_embed_data = result["klines"]
+        self.kline_status_label.config(text="")
+        self._draw_kline_embed()
+
+    def _draw_kline_embed(self):
+        """绘制嵌入的 K线图"""
+        klines = self.kline_embed_data
+        if len(klines) < 2:
+            self.kline_status_label.config(text="数据不足")
+            return
+
+        period_label = {"daily": "日K", "weekly": "周K", "monthly": "月K"}
+        label = period_label.get(self.kline_embed_period, "日K")
+
+        self.kline_ax_price.clear()
+        self.kline_ax_volume.clear()
+
+        # 准备数据
+        x = list(range(len(klines)))
+        opens = [k["open"] for k in klines]
+        closes = [k["close"] for k in klines]
+        highs = [k["high"] for k in klines]
+        lows = [k["low"] for k in klines]
+        volumes = [k["volume"] for k in klines]
+        dates = [k["date"] for k in klines]
+
+        # 蜡烛线
+        cw = 0.6
+        for i in range(len(klines)):
+            color = COLOR_UP if closes[i] >= opens[i] else COLOR_DOWN
+            self.kline_ax_price.plot([x[i], x[i]], [lows[i], highs[i]],
+                                     color=color, linewidth=0.8)
+            bottom = min(opens[i], closes[i])
+            height = abs(closes[i] - opens[i]) or 0.01
+            rect = Rectangle((x[i] - cw / 2, bottom), cw, height,
+                             facecolor=color, edgecolor=color)
+            self.kline_ax_price.add_patch(rect)
+
+        # 均线
+        self._draw_kline_ma(x, closes, 5, COLOR_MA5)
+        self._draw_kline_ma(x, closes, 10, COLOR_MA10)
+        self._draw_kline_ma(x, closes, 20, COLOR_MA20)
+
+        # 价格图样式
+        name = self.name_label.cget("text")
+        self.kline_ax_price.set_title(f"{name} ({self.current_code}) — {label}",
+                                      fontsize=10, fontweight="bold", pad=4)
+        self.kline_ax_price.grid(True, color="#F0F0F0", linewidth=0.5)
+        self.kline_ax_price.set_xlim(-1, len(x))
+        self.kline_ax_price.tick_params(labelbottom=False, labelsize=7)
+
+        # 成交量
+        max_vol = max(volumes) if volumes else 1
+        for i in range(len(klines)):
+            color = "#FFCCCC" if closes[i] >= opens[i] else "#CCE0CC"
+            self.kline_ax_volume.bar(x[i], volumes[i] / max_vol,
+                                     width=0.6, color=color, edgecolor=color)
+
+        self.kline_ax_volume.grid(True, color="#F0F0F0", linewidth=0.5)
+        self.kline_ax_volume.set_xlim(-1, len(x))
+        self.kline_ax_volume.tick_params(labelsize=7)
+
+        # x 轴标签
+        n = max(1, len(dates) // 8)
+        visible_ticks = list(range(0, len(dates), n))
+        visible_dates = [dates[i][-5:] for i in visible_ticks]
+        self.kline_ax_volume.set_xticks(visible_ticks)
+        self.kline_ax_volume.set_xticklabels(visible_dates, fontsize=6.5)
+
+        # 图例
+        legend_lines = [
+            Line2D([0], [0], color=COLOR_MA5, linewidth=1.2, label="MA5"),
+            Line2D([0], [0], color=COLOR_MA10, linewidth=1.2, label="MA10"),
+            Line2D([0], [0], color=COLOR_MA20, linewidth=1.2, label="MA20"),
+        ]
+        self.kline_ax_price.legend(handles=legend_lines, loc="upper left",
+                                   fontsize=7, framealpha=0.8)
+
+        self.kline_fig.tight_layout()
+        self.kline_canvas.draw()
+
+    def _draw_kline_ma(self, x: list, closes: list, period: int,
+                       color: str):
+        """绘制移动平均线"""
+        if len(closes) < period:
+            return
+        ma_values = []
+        for i in range(len(closes)):
+            if i < period - 1:
+                ma_values.append(None)
+            else:
+                ma_values.append(sum(closes[i - period + 1:i + 1]) / period)
+        valid_x = [x[i] for i in range(len(ma_values))
+                   if ma_values[i] is not None]
+        valid_ma = [v for v in ma_values if v is not None]
+        if valid_x:
+            self.kline_ax_price.plot(valid_x, valid_ma, color=color,
+                                     linewidth=1.0, alpha=0.85)
+
+    def _set_kline_buttons_state(self, state: str):
+        """设置 K线按钮状态"""
+        for btn in self.kline_period_btns.values():
+            btn.config(state=state)
+        self.kline_refresh_btn.config(state=state)
 
     # ── 状态栏 ──
 

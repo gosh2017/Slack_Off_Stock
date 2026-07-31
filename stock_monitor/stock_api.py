@@ -167,6 +167,190 @@ def _parse_sina_data(data_str: str) -> dict:
     }
 
 
+# ──────────────── 周期参数（新浪仅支持日K，周K/月K由日线聚合生成）───────────────
+_KLINE_PERIOD_MAP = {
+    "daily":   {"label": "日K", "fetch_count": 120},
+    "weekly":  {"label": "周K", "fetch_count": 400},
+    "monthly": {"label": "月K", "fetch_count": 800},
+}
+
+
+def _aggregate_klines(klines: list, period: str) -> list:
+    """
+    将日K线数据按周/月聚合为周K/月K。
+
+    聚合规则：
+        - date:   该周期最后交易日
+        - open:   该周期第一个交易日的开盘价
+        - close:  该周期最后一个交易日的收盘价
+        - high:   该周期内最高价的最大值
+        - low:    该周期内最低价的最小值
+        - volume: 该周期内成交量的总和
+
+    参数：
+        klines: 日K线列表（按日期升序排列）
+        period: "weekly" 或 "monthly"
+
+    返回：
+        聚合后的K线列表
+    """
+    if not klines:
+        return []
+    if period == "daily":
+        return klines
+
+    from datetime import datetime
+
+    groups = []
+    current_group = []
+    current_key = None
+
+    for k in klines:
+        try:
+            dt = datetime.strptime(k["date"], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+
+        if period == "weekly":
+            # ISO 周：年 + 周数
+            key = dt.strftime("%Y-W%W")
+        else:
+            # 月：年-月
+            key = dt.strftime("%Y-%m")
+
+        if current_key is None:
+            current_key = key
+
+        if key != current_key:
+            # 结束上一组，开始新组
+            groups.append((current_key, current_group))
+            current_group = []
+            current_key = key
+
+        current_group.append(k)
+
+    if current_group:
+        groups.append((current_key, current_group))
+
+    aggregated = []
+    for key, group in groups:
+        aggregated.append({
+            "date":   group[-1]["date"],     # 最后一天日期
+            "open":   group[0]["open"],       # 第一天开盘价
+            "close":  group[-1]["close"],     # 最后一天收盘价
+            "high":   max(k["high"] for k in group),
+            "low":    min(k["low"] for k in group),
+            "volume": sum(k["volume"] for k in group),
+        })
+
+    return aggregated
+
+
+def query_kline_data(stock_code: str, stock_type: str = "stock",
+                     period: str = "daily", count: int = 120) -> dict:
+    """
+    查询股票 K 线数据（日K / 周K / 月K）。
+
+    使用新浪财经免费 API 获取日K线数据，周K/月K由日线聚合生成。
+
+    参数：
+        stock_code: 股票代码（纯数字）
+        stock_type: 查询类型，"stock" / "index" / "etf"
+        period:     K线周期，"daily"（默认）/ "weekly" / "monthly"
+        count:      返回的数据条数（默认 120）
+
+    返回：
+        {
+            "error": None / 错误信息字符串,
+            "klines": [
+                {
+                    "date":   "2026-07-01",
+                    "open":   18.50,
+                    "close":  18.88,
+                    "high":   19.00,
+                    "low":    18.40,
+                    "volume": 12345678,       # 成交量（股）
+                },
+                ...
+            ]
+        }
+    """
+    result = {
+        "error": None,
+        "klines": [],
+    }
+
+    try:
+        # 使用已有的 _build_code 获取新浪格式代码
+        full_code = _build_code(stock_code, stock_type)
+
+        # 日K线需要足够的数据量来聚合周K/月K
+        period_info = _KLINE_PERIOD_MAP.get(period, _KLINE_PERIOD_MAP["daily"])
+        fetch_count = period_info["fetch_count"]
+
+        # 新浪财经日K线 API
+        url = (
+            "https://quotes.sina.cn/cn/api/json_v2.php/"
+            "CN_MarketData.getKLineData"
+            f"?symbol={full_code}"
+            f"&scale=240"
+            f"&datalen={fetch_count}"
+        )
+
+        response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        response.encoding = "utf-8"
+        response.raise_for_status()
+
+        raw_data = response.json()
+        if not raw_data or not isinstance(raw_data, list):
+            raise ValueError("API 返回数据为空")
+
+        # 解析日K线（按日期升序排列）
+        daily_klines = []
+        for item in raw_data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                daily_klines.append({
+                    "date":   item.get("day", ""),
+                    "open":   float(item.get("open", 0)),
+                    "close":  float(item.get("close", 0)),
+                    "high":   float(item.get("high", 0)),
+                    "low":    float(item.get("low", 0)),
+                    "volume": int(float(item.get("volume", 0))),
+                })
+            except (ValueError, TypeError):
+                continue
+
+        if not daily_klines:
+            raise ValueError("K线数据解析失败")
+
+        # 按日期升序（API返回已升序，但确保一下）
+        daily_klines.sort(key=lambda k: k["date"])
+
+        # 按需聚合
+        if period == "daily":
+            result["klines"] = daily_klines
+        else:
+            aggregated = _aggregate_klines(daily_klines, period)
+            if not aggregated:
+                raise ValueError(f"{period} 聚合失败，数据不足")
+            result["klines"] = aggregated
+
+    except requests.exceptions.Timeout:
+        result["error"] = f"请求超时（{TIMEOUT}秒），请检查网络连接"
+    except requests.exceptions.ConnectionError:
+        result["error"] = "网络连接失败，请检查网络"
+    except requests.exceptions.RequestException as e:
+        result["error"] = f"网络请求异常：{e}"
+    except ValueError as e:
+        result["error"] = f"数据解析错误：{e}"
+    except Exception as e:
+        result["error"] = f"未知错误：{e}"
+
+    return result
+
+
 def query_stock(stock_code: str, stock_type: str = "stock") -> dict:
     """
     查询单只 A 股股票 / 指数 / 场内 ETF 的实时行情数据。
