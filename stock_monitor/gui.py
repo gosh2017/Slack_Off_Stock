@@ -347,6 +347,7 @@ class StockMonitorApp:
         # 监控列表相关
         self.watchlist = []        # 当前监控列表 [{code, type, name, price}]
         self._watchlist_loading = False
+        self._watchlist_visible = False  # 监控面板是否已 pack 显示
         self._context_menu = None  # 右键菜单
 
         self._build_ui()
@@ -533,7 +534,7 @@ class StockMonitorApp:
             messagebox.showinfo("提示", f"{code} 已在监控列表中")
 
     def _refresh_watchlist(self):
-        """重新加载并渲染监控列表"""
+        """重新加载并渲染监控列表（有内容时显示面板）"""
         for item in self.watch_tree.get_children():
             self.watch_tree.delete(item)
         self.watchlist = load_watchlist()
@@ -549,6 +550,16 @@ class StockMonitorApp:
                 "--",
                 "--",
             ))
+        # 列表非空时显示面板，空列表时隐藏
+        if self.watchlist:
+            if not self._watchlist_visible:
+                self.watch_frame.pack(
+                    fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
+                self._watchlist_visible = True
+        else:
+            if self._watchlist_visible:
+                self.watch_frame.pack_forget()
+                self._watchlist_visible = False
 
     def _refresh_watchlist_data(self):
         """异步刷新监控列表中每只股票的最新数据"""
