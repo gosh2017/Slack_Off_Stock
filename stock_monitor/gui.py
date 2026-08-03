@@ -19,6 +19,10 @@ from datetime import datetime
 from stock_monitor.stock_api import query_stock, query_kline_data
 from stock_monitor.stock_search import search_stocks
 from stock_monitor.history_manager import save_query, load_history, clear_history
+from stock_monitor.watchlist_manager import (
+    load_watchlist, add_to_watchlist,
+    remove_from_watchlist, is_in_watchlist,
+)
 
 # ──────────────── 可选依赖：matplotlib（嵌入 K线图用） ────────────────
 try:
@@ -53,6 +57,254 @@ FONT_BTN = ("微软雅黑", 8)
 
 # 类型中英文映射
 _TYPE_LABEL = {"stock": "股票", "index": "指数", "etf": "ETF"}
+
+
+# ──────────────── K线图表独立窗口 ────────────────
+
+class KlineWindow:
+    """独立的 K线图表窗口（Toplevel），支持日K/周K/月K。"""
+
+    def __init__(self, code: str, stock_type: str, name: str = ""):
+        self.code = code
+        self.stock_type = stock_type
+        self.name = name
+        self.kline_data = []
+        self.period = "daily"
+        self._loading = False
+
+        # 窗口
+        self.win = tk.Toplevel()
+        self.win.title(f"K线 — {name or code} ({code})")
+        self.win.geometry("780x560")
+        self.win.minsize(520, 380)
+        self.win.configure(bg=COLOR_BG)
+
+        # UI
+        self._build_toolbar()
+        self.kline_fig = None
+        self.kline_canvas = None
+        self.kline_ax_price = None
+        self.kline_ax_volume = None
+        self.kline_placeholder = tk.Label(
+            self.win, text="", font=("微软雅黑", 9),
+            bg="white", fg="#AAA", anchor=tk.CENTER,
+        )
+        self.kline_placeholder.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+
+        if not MATPLOTLIB_OK:
+            self.kline_placeholder.config(
+                text="请安装 matplotlib 以显示 K线图\n\npip install matplotlib")
+        else:
+            self._fetch_kline()
+
+    # ── 工具栏 ──
+
+    def _build_toolbar(self):
+        toolbar = tk.Frame(self.win, bg=COLOR_BG)
+        toolbar.pack(fill=tk.X, padx=6, pady=(6, 2))
+
+        self.status_label = tk.Label(
+            toolbar, text="", font=("微软雅黑", 8),
+            bg=COLOR_BG, fg="#888",
+        )
+        self.status_label.pack(side=tk.LEFT, padx=2)
+
+        self.period_btns = {}
+        btn_style = {"font": ("微软雅黑", 8), "width": 4,
+                     "bg": "#E0E0E0", "fg": "#333"}
+        for key, label in [("daily", "日K"), ("weekly", "周K"),
+                           ("monthly", "月K")]:
+            btn = tk.Button(
+                toolbar, text=label, **btn_style,
+                command=lambda p=key: self._switch_period(p),
+            )
+            btn.pack(side=tk.RIGHT, padx=1)
+            self.period_btns[key] = btn
+
+        self.refresh_btn = tk.Button(
+            toolbar, text="刷新", font=("微软雅黑", 8), width=4,
+            bg="#E0E0E0", fg="#333", command=self._fetch_kline,
+        )
+        self.refresh_btn.pack(side=tk.RIGHT, padx=4)
+
+    # ── 数据获取 ──
+
+    def _fetch_kline(self):
+        if not MATPLOTLIB_OK or self._loading or not self.code:
+            return
+        self._loading = True
+        self.status_label.config(text="加载中...")
+        self._set_btn_state(tk.DISABLED)
+
+        count_map = {"daily": 120, "weekly": 400, "monthly": 800}
+        count = count_map.get(self.period, 120)
+        threading.Thread(
+            target=self._fetch_thread,
+            args=(count,), daemon=True,
+        ).start()
+
+    def _fetch_thread(self, count: int):
+        result = query_kline_data(
+            self.code, self.stock_type,
+            period=self.period, count=count,
+        )
+        self.win.after(0, self._on_data_ready, result)
+
+    def _on_data_ready(self, result):
+        self._loading = False
+        self._set_btn_state(tk.NORMAL)
+
+        if result["error"]:
+            self.status_label.config(text="查询失败")
+            if self.kline_ax_price:
+                self.kline_ax_price.clear()
+                self.kline_ax_volume.clear()
+                self.kline_ax_price.text(
+                    0.5, 0.5, f"查询失败: {result['error']}",
+                    transform=self.kline_ax_price.transAxes,
+                    ha="center", va="center", fontsize=9, color="#888")
+                self.kline_canvas.draw()
+            return
+
+        self.kline_data = result["klines"]
+        self.status_label.config(text="")
+        self._init_figure()
+        self._draw()
+
+    # ── matplotlib 初始化 ──
+
+    def _init_figure(self):
+        if self.kline_fig is not None:
+            return
+        matplotlib.rcParams["font.sans-serif"] = [
+            "Microsoft YaHei", "SimHei"]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+
+        self.kline_fig = Figure(figsize=(7, 4.2), dpi=100,
+                                facecolor="white")
+        self.kline_fig.subplots_adjust(left=0.07, right=0.97,
+                                       bottom=0.12, top=0.95,
+                                       hspace=0.10)
+
+        self.kline_ax_price = self.kline_fig.add_subplot(3, 1, (1, 2))
+        self.kline_ax_volume = self.kline_fig.add_subplot(
+            3, 1, 3, sharex=self.kline_ax_price)
+
+        self.kline_placeholder.pack_forget()
+        self.kline_canvas = FigureCanvasTkAgg(self.kline_fig,
+                                              master=self.win)
+        self.kline_canvas.get_tk_widget().pack(
+            fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+
+    # ── 绘制 ──
+
+    def _draw(self):
+        klines = self.kline_data
+        if len(klines) < 2:
+            self.status_label.config(text="数据不足")
+            return
+
+        period_label = {"daily": "日K", "weekly": "周K",
+                        "monthly": "月K"}
+        label = period_label.get(self.period, "日K")
+
+        self.kline_ax_price.clear()
+        self.kline_ax_volume.clear()
+
+        x = list(range(len(klines)))
+        opens = [k["open"] for k in klines]
+        closes = [k["close"] for k in klines]
+        highs = [k["high"] for k in klines]
+        lows = [k["low"] for k in klines]
+        volumes = [k["volume"] for k in klines]
+        dates = [k["date"] for k in klines]
+
+        cw = 0.6
+        for i in range(len(klines)):
+            color = COLOR_UP if closes[i] >= opens[i] else COLOR_DOWN
+            self.kline_ax_price.plot([x[i], x[i]], [lows[i], highs[i]],
+                                     color=color, linewidth=0.8)
+            bottom = min(opens[i], closes[i])
+            height = abs(closes[i] - opens[i]) or 0.01
+            rect = Rectangle((x[i] - cw / 2, bottom), cw, height,
+                             facecolor=color, edgecolor=color)
+            self.kline_ax_price.add_patch(rect)
+
+        self._draw_ma(x, closes, 5, COLOR_MA5)
+        self._draw_ma(x, closes, 10, COLOR_MA10)
+        self._draw_ma(x, closes, 20, COLOR_MA20)
+
+        self.kline_ax_price.set_title(
+            f"{self.name or ''} ({self.code}) — {label}",
+            fontsize=11, fontweight="bold", pad=4)
+        self.kline_ax_price.grid(True, color="#F0F0F0", linewidth=0.5)
+        self.kline_ax_price.set_xlim(-1, len(x))
+        self.kline_ax_price.tick_params(labelbottom=False,
+                                        labelsize=7)
+
+        max_vol = max(volumes) if volumes else 1
+        for i in range(len(klines)):
+            color = "#FFCCCC" if closes[i] >= opens[i] else "#CCE0CC"
+            self.kline_ax_volume.bar(x[i], volumes[i] / max_vol,
+                                     width=0.6, color=color,
+                                     edgecolor=color)
+
+        self.kline_ax_volume.grid(True, color="#F0F0F0", linewidth=0.5)
+        self.kline_ax_volume.set_xlim(-1, len(x))
+        self.kline_ax_volume.tick_params(labelsize=7)
+
+        n = max(1, len(dates) // 8)
+        visible_ticks = list(range(0, len(dates), n))
+        visible_dates = [dates[i][-5:] for i in visible_ticks]
+        self.kline_ax_volume.set_xticks(visible_ticks)
+        self.kline_ax_volume.set_xticklabels(visible_dates, fontsize=6.5)
+
+        legend_lines = [
+            Line2D([0], [0], color=COLOR_MA5, linewidth=1.2,
+                   label="MA5"),
+            Line2D([0], [0], color=COLOR_MA10, linewidth=1.2,
+                   label="MA10"),
+            Line2D([0], [0], color=COLOR_MA20, linewidth=1.2,
+                   label="MA20"),
+        ]
+        self.kline_ax_price.legend(handles=legend_lines,
+                                   loc="upper left",
+                                   fontsize=7, framealpha=0.8)
+
+        self.kline_fig.tight_layout()
+        self.kline_canvas.draw()
+
+    def _draw_ma(self, x: list, closes: list,
+                 period: int, color: str):
+        if len(closes) < period:
+            return
+        ma_values = []
+        for i in range(len(closes)):
+            if i < period - 1:
+                ma_values.append(None)
+            else:
+                ma_values.append(
+                    sum(closes[i - period + 1:i + 1]) / period)
+        valid_x = [x[i] for i in range(len(ma_values))
+                   if ma_values[i] is not None]
+        valid_ma = [v for v in ma_values if v is not None]
+        if valid_x:
+            self.kline_ax_price.plot(valid_x, valid_ma,
+                                     color=color,
+                                     linewidth=1.0, alpha=0.85)
+
+    # ── 事件 ──
+
+    def _switch_period(self, period: str):
+        if period == self.period or self._loading:
+            return
+        self.period = period
+        self._fetch_kline()
+
+    def _set_btn_state(self, state: str):
+        for btn in self.period_btns.values():
+            btn.config(state=state)
+        self.refresh_btn.config(state=state)
 
 
 
@@ -90,12 +342,15 @@ class StockMonitorApp:
         self._popup_window = None
         self._popup_refresh_timer = None
 
-        # K线图嵌入相关
-        self.kline_embed_data = []
-        self.kline_embed_period = "daily"
-        self._kline_loading = False
+        # K线图嵌入相关（已移至独立 KlineWindow，不再使用）
+
+        # 监控列表相关
+        self.watchlist = []        # 当前监控列表 [{code, type, name, price}]
+        self._watchlist_loading = False
+        self._context_menu = None  # 右键菜单
 
         self._build_ui()
+        self._refresh_watchlist()
         self._refresh_history_table()
         self._poll_queue()
 
@@ -103,6 +358,7 @@ class StockMonitorApp:
 
     def _build_ui(self):
         self._build_input_area()
+        self._build_watchlist()
         self._build_search_results()
         self._build_info_table()
         self._build_control_area()
@@ -145,7 +401,228 @@ class StockMonitorApp:
         )
         self.query_btn.pack(side=tk.LEFT, padx=1)
 
-    # ── 搜索结果显示 ──
+        self.add_watch_btn = tk.Button(
+            input_frame, text="加入监控", font=FONT_BTN, width=8,
+            bg="#E0E0E0", fg="#333", command=self._on_add_to_watch,
+        )
+        self.add_watch_btn.pack(side=tk.LEFT, padx=1)
+
+    # ── 监控列表 ──
+
+    def _build_watchlist(self):
+        self.watch_frame = tk.Frame(self.root, bg="#EFEFEF",
+                                    relief=tk.SUNKEN, bd=1)
+        self.watch_frame.pack_forget()
+
+        # 标题行
+        title_row = tk.Frame(self.watch_frame, bg="#EFEFEF")
+        title_row.pack(fill=tk.X, padx=4, pady=(3, 1))
+
+        tk.Label(title_row, text="监控列表（双击查询，右键打开K线/移除）：",
+                 font=FONT_LABEL, bg="#EFEFEF", fg="#333"
+                 ).pack(side=tk.LEFT, anchor=tk.W)
+
+        self.watch_count_label = tk.Label(
+            title_row, text="(0)", font=FONT_LABEL,
+            bg="#EFEFEF", fg="#888",
+        )
+        self.watch_count_label.pack(side=tk.RIGHT, padx=4)
+
+        # Treeview
+        tree_frame = tk.Frame(self.watch_frame, bg="#EFEFEF")
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        columns = ("code", "type", "name", "price", "change", "time")
+        self.watch_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings",
+            height=3,
+        )
+
+        watch_col_defs = {
+            "code":   ("代码",  60, tk.CENTER),
+            "type":   ("类型",  40, tk.CENTER),
+            "name":   ("名称",  110, tk.W),
+            "price":  ("最新价", 60, tk.E),
+            "change": ("涨跌",  60, tk.E),
+            "time":   ("时间",  100, tk.CENTER),
+        }
+        for col_id, (heading, width, anchor) in watch_col_defs.items():
+            self.watch_tree.heading(col_id, text=heading)
+            self.watch_tree.column(col_id, width=width, anchor=anchor)
+
+        self.watch_tree.pack(fill=tk.BOTH, expand=True)
+
+        # 双击查询
+        self.watch_tree.bind("<Double-Button-1>", self._on_select_watch)
+        # 右键菜单
+        self.watch_tree.bind("<Button-3>", self._on_watch_right_click)
+
+    def _on_watch_right_click(self, event):
+        """监控列表右键：弹出菜单，移除股票"""
+        row = self.watch_tree.identify_row(event.y)
+        if not row:
+            return
+        self.watch_tree.selection_set(row)
+        if self._context_menu is None:
+            self._context_menu = tk.Menu(self.root, tearoff=False)
+            self._context_menu.add_command(
+                label="打开K线窗口",
+                command=self._on_watch_open_kline,
+            )
+            self._context_menu.add_command(
+                label="移除",
+                command=self._on_remove_from_watch,
+            )
+        self._context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_remove_from_watch(self):
+        """从监控列表移除当前选中的股票"""
+        sel = self.watch_tree.selection()
+        if not sel:
+            return
+        values = self.watch_tree.item(sel[0], "values")
+        code = values[0]
+        type_label = values[1]
+        type_map = {"股票": "stock", "指数": "index", "ETF": "etf"}
+        stock_type = type_map.get(type_label, "stock")
+
+        remove_from_watchlist(code, stock_type)
+        self._refresh_watchlist()
+        self.status_var.set(f"已移除 {code}")
+
+    def _on_select_watch(self, event=None):
+        """监控列表双击：查询该股票（同查询行为）"""
+        sel = self.watch_tree.selection()
+        if not sel:
+            return
+        values = self.watch_tree.item(sel[0], "values")
+        code = values[0]
+        type_label = values[1]
+        type_map = {"股票": "stock", "指数": "index", "ETF": "etf"}
+        self.type_var.set(type_label)
+        self.code_entry.delete(0, tk.END)
+        self.code_entry.insert(0, code)
+        self.code_entry.focus()
+        self.status_var.set(f"查询 {code} ...")
+        self._on_query()
+
+    def _on_add_to_watch(self):
+        """按钮：将当前输入框中的代码加入监控列表"""
+        code = self.code_entry.get().strip()
+        if not code:
+            messagebox.showwarning("提示", "请输入股票代码")
+            return
+        if not code.isdigit():
+            messagebox.showwarning("提示", "代码必须为纯数字")
+            return
+        type_map = {"股票": "stock", "指数": "index", "ETF": "etf"}
+        stock_type = type_map.get(self.type_var.get(), "stock")
+        if is_in_watchlist(code, stock_type):
+            messagebox.showinfo("提示", f"{code} 已在监控列表中")
+            return
+        # 先查询一次以获取名称
+        data = query_stock(code, stock_type)
+        if data["error"]:
+            messagebox.showwarning("提示", f"查询失败：{data['error']}")
+            return
+        if add_to_watchlist(code, stock_type, data["name"], data["price"]):
+            self._refresh_watchlist()
+            self._refresh_watchlist_data()
+            self.status_var.set(f"已加入监控：{data['name']}")
+        else:
+            messagebox.showinfo("提示", f"{code} 已在监控列表中")
+
+    def _refresh_watchlist(self):
+        """重新加载并渲染监控列表"""
+        for item in self.watch_tree.get_children():
+            self.watch_tree.delete(item)
+        self.watchlist = load_watchlist()
+        self.watch_count_label.config(text=f"({len(self.watchlist)})")
+        for item in self.watchlist:
+            type_label = _TYPE_LABEL.get(item.get("type", ""), "股票")
+            price = item.get("price", 0.0)
+            self.watch_tree.insert("", tk.END, values=(
+                item.get("code", ""),
+                type_label,
+                item.get("name", ""),
+                f"{price:.2f}" if price else "--",
+                "--",
+                "--",
+            ))
+
+    def _refresh_watchlist_data(self):
+        """异步刷新监控列表中每只股票的最新数据"""
+        if self._watchlist_loading:
+            return
+        if not self.watchlist:
+            return
+        self._watchlist_loading = True
+        self.status_var.set(f"刷新监控列表（{len(self.watchlist)}只）...")
+        for item in self.watchlist:
+            threading.Thread(
+                target=self._watchlist_fetch_thread,
+                args=(item["code"], item.get("type", "stock")),
+                daemon=True,
+            ).start()
+
+    def _watchlist_fetch_thread(self, code, stock_type):
+        """后台线程：获取监控列表中一只股票的行情"""
+        data = query_stock(code, stock_type)
+        self.data_queue.put({"_watchlist_refresh": True,
+                             "code": code,
+                             "type": stock_type,
+                             "data": data})
+
+    def _update_watchlist_display(self, msg):
+        """监控列表数据更新：更新 Treeview 行"""
+        code = msg["code"]
+        stock_type = msg["type"]
+        data = msg["data"]
+
+        type_label = _TYPE_LABEL.get(stock_type, "股票")
+        for item_id in self.watch_tree.get_children():
+            values = self.watch_tree.item(item_id, "values")
+            if values[0] == code:
+                if data["error"]:
+                    self.watch_tree.item(item_id, values=(
+                        code, type_label, "--", "--", "--", "--",
+                    ))
+                else:
+                    price = data["price"]
+                    change = data["change_percent"]
+                    name = data.get("name", "")
+                    time_str = f"{data.get('time', '--')}"
+                    if price > data.get("yesterday_close", 0):
+                        change_str = f"{change:+.2f}%"
+                    elif price < data.get("yesterday_close", 0):
+                        change_str = f"{change:+.2f}%"
+                    else:
+                        change_str = f"{change:.2f}%"
+                    self.watch_tree.item(item_id, values=(
+                        code, type_label, name,
+                        f"{price:.2f}",
+                        change_str,
+                        time_str,
+                    ))
+                    # 同步持久化名称和价格
+                    for wi in self.watchlist:
+                        if wi.get("code") == code and wi.get("type") == stock_type:
+                            wi["name"] = name
+                            wi["price"] = price
+                            break
+                    # 若当前正在查询的就是这只，同步详情
+                    if self.current_code == code and self.current_type == stock_type:
+                        self._update_display(msg)
+                break
+        # 所有项处理完毕后解除锁定
+        self.root.after(10, self._maybe_finish_watchlist_refresh)
+
+    def _maybe_finish_watchlist_refresh(self):
+        """检查是否所有监控项都已刷新完毕"""
+        self._watchlist_loading = False
+        self.status_var.set(
+            f"监控列表：{len(self.watchlist)} 只股票"
+        )
 
     def _build_search_results(self):
         self.search_frame = tk.Frame(self.root, bg=COLOR_SEARCH_BG,
@@ -265,25 +742,24 @@ class StockMonitorApp:
         )
         self.popup_btn.pack(side=tk.LEFT, padx=4)
 
-    # ── 底部区域（Notebook 切换历史 / K线） ──
+        # K线窗口按钮
+        self.kline_btn = tk.Button(
+            ctrl_frame, text="K线", font=FONT_BTN, width=6,
+            bg="#E0E0E0", fg="#333", command=self._on_open_kline,
+        )
+        self.kline_btn.pack(side=tk.LEFT, padx=4)
+
+    # ── 底部区域（历史记录） ──
 
     def _build_bottom_area(self):
-        """底部 Notebook：历史记录 + K线图"""
+        """底部：历史记录"""
         self.bottom_notebook = ttk.Notebook(self.root)
         self.bottom_notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(2, 0))
 
-        # ── Tab 1: 历史记录 ──
+        # ── Tab: 历史记录 ──
         history_frame = tk.Frame(self.bottom_notebook, bg=COLOR_BG)
         self.bottom_notebook.add(history_frame, text="历史")
         self._build_history_tab(history_frame)
-
-        # ── Tab 2: K线图 ──
-        kline_frame = tk.Frame(self.bottom_notebook, bg=COLOR_BG)
-        self.bottom_notebook.add(kline_frame, text="K线")
-        self._build_kline_tab(kline_frame)
-
-        # 监听 tab 切换
-        self.bottom_notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_history_tab(self, parent):
         """构建历史记录 tab"""
@@ -322,249 +798,6 @@ class StockMonitorApp:
 
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.history_tree.bind("<Double-Button-1>", self._on_select_history)
-
-    # ── K线图嵌入 tab ──
-
-    def _build_kline_tab(self, parent):
-        """构建 K线图嵌入 tab"""
-        # 工具栏
-        kline_toolbar = tk.Frame(parent, bg=COLOR_BG)
-        kline_toolbar.pack(fill=tk.X, padx=4, pady=(4, 2))
-
-        self.kline_status_label = tk.Label(
-            kline_toolbar, text="", font=("微软雅黑", 8),
-            bg=COLOR_BG, fg="#888",
-        )
-        self.kline_status_label.pack(side=tk.LEFT, padx=2)
-
-        # 周期按钮
-        self.kline_period_btns = {}
-        btn_style = {"font": ("微软雅黑", 8), "width": 4,
-                     "bg": "#E0E0E0", "fg": "#333"}
-        for key, label in [("daily", "日K"), ("weekly", "周K"), ("monthly", "月K")]:
-            btn = tk.Button(
-                kline_toolbar, text=label, **btn_style,
-                command=lambda p=key: self._switch_kline_period(p),
-            )
-            btn.pack(side=tk.RIGHT, padx=1)
-            self.kline_period_btns[key] = btn
-
-        # 刷新按钮
-        self.kline_refresh_btn = tk.Button(
-            kline_toolbar, text="刷新", font=("微软雅黑", 8), width=4,
-            bg="#E0E0E0", fg="#333", command=self._refresh_kline_embed,
-        )
-        self.kline_refresh_btn.pack(side=tk.RIGHT, padx=4)
-
-        # 提示信息
-        self.kline_placeholder = tk.Label(
-            parent, text="", font=("微软雅黑", 9),
-            bg="white", fg="#AAA", anchor=tk.CENTER,
-        )
-        self.kline_placeholder.pack(fill=tk.BOTH, expand=True)
-
-        # matplotlib 图表容器
-        self.kline_fig = None
-        self.kline_canvas = None
-        self.kline_ax_price = None
-        self.kline_ax_volume = None
-
-        if not MATPLOTLIB_OK:
-            self.kline_placeholder.config(
-                text="请安装 matplotlib 以显示 K线图\n\npip install matplotlib")
-
-    def _init_kline_figure(self):
-        """初始化 matplotlib 图表（首次使用时调用）"""
-        if self.kline_fig is not None:
-            return
-        if not MATPLOTLIB_OK:
-            return
-
-        matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
-        matplotlib.rcParams["axes.unicode_minus"] = False
-
-        self.kline_fig = Figure(figsize=(5, 3), dpi=100, facecolor="white")
-        self.kline_fig.subplots_adjust(left=0.07, right=0.97, bottom=0.12,
-                                       top=0.95, hspace=0.10)
-
-        self.kline_ax_price = self.kline_fig.add_subplot(3, 1, (1, 2))
-        self.kline_ax_volume = self.kline_fig.add_subplot(3, 1, 3,
-                                                          sharex=self.kline_ax_price)
-
-        # 找到 K线 tab 的容器 frame
-        kline_frame = self.kline_placeholder.master
-        self.kline_placeholder.pack_forget()
-
-        self.kline_canvas = FigureCanvasTkAgg(self.kline_fig, master=kline_frame)
-        self.kline_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
-
-    # ── K线图 tab 事件 ──
-
-    def _on_tab_changed(self, event=None):
-        """Notebook tab 切换事件"""
-        selected = self.bottom_notebook.select()
-        tab_text = self.bottom_notebook.tab(selected, "text")
-        if tab_text == "K线":
-            self._refresh_kline_embed()
-
-    def _switch_kline_period(self, period: str):
-        """切换 K线周期"""
-        if period == self.kline_embed_period or self._kline_loading:
-            return
-        self.kline_embed_period = period
-        self._refresh_kline_embed()
-
-    def _refresh_kline_embed(self):
-        """刷新嵌入的 K线图"""
-        if not self.current_code:
-            self.kline_status_label.config(text="请先查询股票")
-            return
-        if self._kline_loading:
-            return
-        if not MATPLOTLIB_OK:
-            return
-
-        self._init_kline_figure()
-        self._kline_loading = True
-        self.kline_status_label.config(text="加载中...")
-        self._set_kline_buttons_state(tk.DISABLED)
-
-        threading.Thread(target=self._fetch_kline_thread, daemon=True).start()
-
-    def _fetch_kline_thread(self):
-        """后台线程：获取 K线数据"""
-        count = 120
-        for key, label, c in [("daily", "日K", 120), ("weekly", "周K", 400),
-                               ("monthly", "月K", 800)]:
-            if key == self.kline_embed_period:
-                count = c
-                break
-        result = query_kline_data(
-            self.current_code, self.current_type,
-            period=self.kline_embed_period, count=count,
-        )
-        self.root.after(0, self._on_kline_data_ready, result)
-
-    def _on_kline_data_ready(self, result):
-        """K线数据就绪，更新图表"""
-        self._kline_loading = False
-        self._set_kline_buttons_state(tk.NORMAL)
-
-        if result["error"]:
-            self.kline_status_label.config(text="查询失败")
-            if self.kline_ax_price:
-                self.kline_ax_price.clear()
-                self.kline_ax_volume.clear()
-                self.kline_ax_price.text(0.5, 0.5, f"查询失败: {result['error']}",
-                                         transform=self.kline_ax_price.transAxes,
-                                         ha="center", va="center", fontsize=9, color="#888")
-                self.kline_canvas.draw()
-            return
-
-        self.kline_embed_data = result["klines"]
-        self.kline_status_label.config(text="")
-        self._draw_kline_embed()
-
-    def _draw_kline_embed(self):
-        """绘制嵌入的 K线图"""
-        klines = self.kline_embed_data
-        if len(klines) < 2:
-            self.kline_status_label.config(text="数据不足")
-            return
-
-        period_label = {"daily": "日K", "weekly": "周K", "monthly": "月K"}
-        label = period_label.get(self.kline_embed_period, "日K")
-
-        self.kline_ax_price.clear()
-        self.kline_ax_volume.clear()
-
-        # 准备数据
-        x = list(range(len(klines)))
-        opens = [k["open"] for k in klines]
-        closes = [k["close"] for k in klines]
-        highs = [k["high"] for k in klines]
-        lows = [k["low"] for k in klines]
-        volumes = [k["volume"] for k in klines]
-        dates = [k["date"] for k in klines]
-
-        # 蜡烛线
-        cw = 0.6
-        for i in range(len(klines)):
-            color = COLOR_UP if closes[i] >= opens[i] else COLOR_DOWN
-            self.kline_ax_price.plot([x[i], x[i]], [lows[i], highs[i]],
-                                     color=color, linewidth=0.8)
-            bottom = min(opens[i], closes[i])
-            height = abs(closes[i] - opens[i]) or 0.01
-            rect = Rectangle((x[i] - cw / 2, bottom), cw, height,
-                             facecolor=color, edgecolor=color)
-            self.kline_ax_price.add_patch(rect)
-
-        # 均线
-        self._draw_kline_ma(x, closes, 5, COLOR_MA5)
-        self._draw_kline_ma(x, closes, 10, COLOR_MA10)
-        self._draw_kline_ma(x, closes, 20, COLOR_MA20)
-
-        # 价格图样式
-        name = self.name_label.cget("text")
-        self.kline_ax_price.set_title(f"{name} ({self.current_code}) — {label}",
-                                      fontsize=10, fontweight="bold", pad=4)
-        self.kline_ax_price.grid(True, color="#F0F0F0", linewidth=0.5)
-        self.kline_ax_price.set_xlim(-1, len(x))
-        self.kline_ax_price.tick_params(labelbottom=False, labelsize=7)
-
-        # 成交量
-        max_vol = max(volumes) if volumes else 1
-        for i in range(len(klines)):
-            color = "#FFCCCC" if closes[i] >= opens[i] else "#CCE0CC"
-            self.kline_ax_volume.bar(x[i], volumes[i] / max_vol,
-                                     width=0.6, color=color, edgecolor=color)
-
-        self.kline_ax_volume.grid(True, color="#F0F0F0", linewidth=0.5)
-        self.kline_ax_volume.set_xlim(-1, len(x))
-        self.kline_ax_volume.tick_params(labelsize=7)
-
-        # x 轴标签
-        n = max(1, len(dates) // 8)
-        visible_ticks = list(range(0, len(dates), n))
-        visible_dates = [dates[i][-5:] for i in visible_ticks]
-        self.kline_ax_volume.set_xticks(visible_ticks)
-        self.kline_ax_volume.set_xticklabels(visible_dates, fontsize=6.5)
-
-        # 图例
-        legend_lines = [
-            Line2D([0], [0], color=COLOR_MA5, linewidth=1.2, label="MA5"),
-            Line2D([0], [0], color=COLOR_MA10, linewidth=1.2, label="MA10"),
-            Line2D([0], [0], color=COLOR_MA20, linewidth=1.2, label="MA20"),
-        ]
-        self.kline_ax_price.legend(handles=legend_lines, loc="upper left",
-                                   fontsize=7, framealpha=0.8)
-
-        self.kline_fig.tight_layout()
-        self.kline_canvas.draw()
-
-    def _draw_kline_ma(self, x: list, closes: list, period: int,
-                       color: str):
-        """绘制移动平均线"""
-        if len(closes) < period:
-            return
-        ma_values = []
-        for i in range(len(closes)):
-            if i < period - 1:
-                ma_values.append(None)
-            else:
-                ma_values.append(sum(closes[i - period + 1:i + 1]) / period)
-        valid_x = [x[i] for i in range(len(ma_values))
-                   if ma_values[i] is not None]
-        valid_ma = [v for v in ma_values if v is not None]
-        if valid_x:
-            self.kline_ax_price.plot(valid_x, valid_ma, color=color,
-                                     linewidth=1.0, alpha=0.85)
-
-    def _set_kline_buttons_state(self, state: str):
-        """设置 K线按钮状态"""
-        for btn in self.kline_period_btns.values():
-            btn.config(state=state)
-        self.kline_refresh_btn.config(state=state)
 
     # ── 状态栏 ──
 
@@ -836,6 +1069,42 @@ class StockMonitorApp:
         self.popup_price_label.config(text=f"{price:.2f}", fg=color)
         self.popup_change_label.config(text=f"{change:+.2f}%", fg=color)
 
+    # ──────────────── K线窗口 ────────────────
+
+    def _on_open_kline(self):
+        """打开当前查询股票的 K线窗口"""
+        if not self.current_code:
+            messagebox.showinfo("提示", "请先查询一只股票后再打开 K线窗口")
+            return
+        self._open_kline_window(
+            self.current_code, self.current_type, self.name_label.cget("text"))
+
+    def _on_watch_open_kline(self):
+        """监控列表右键：打开选中股票的 K线窗口"""
+        sel = self.watch_tree.selection()
+        if not sel:
+            return
+        values = self.watch_tree.item(sel[0], "values")
+        code = values[0]
+        type_label = values[1]
+        name = values[2] if values[2] not in (None, "--") else code
+        type_map = {"股票": "stock", "指数": "index", "ETF": "etf"}
+        stock_type = type_map.get(type_label, "stock")
+        self._open_kline_window(code, stock_type, name)
+
+    def _open_kline_window(self, code, stock_type, name=""):
+        """创建/打开指定股票的 K线窗口（单例：同类只开一个）"""
+        # 若已有，则聚焦
+        if hasattr(self, "_kline_windows"):
+            key = (code, stock_type)
+            if key in self._kline_windows and not self._kline_windows[key].win.winfo_destroyed():
+                self._kline_windows[key].win.lift()
+                return
+        else:
+            self._kline_windows = {}
+        kw = KlineWindow(code, stock_type, name)
+        self._kline_windows[(code, stock_type)] = kw
+
     # ──────────────── 后台线程 ────────────────
 
     def _search_thread(self, keyword):
@@ -854,6 +1123,8 @@ class StockMonitorApp:
                 msg = self.data_queue.get_nowait()
                 if msg.get("_popup"):
                     self._update_popup(msg["data"])
+                elif msg.get("_watchlist_refresh"):
+                    self._update_watchlist_display(msg)
                 elif msg.get("_search"):
                     self._show_search_results(msg)
                 else:
@@ -886,6 +1157,8 @@ class StockMonitorApp:
         threading.Thread(target=self._fetch_data_thread,
                          args=(self.current_code, self.current_type),
                          daemon=True).start()
+        # 同时刷新监控列表
+        self._refresh_watchlist_data()
         self.after_id = self.root.after(
             self.refresh_interval * 1000, self._schedule_refresh)
 
