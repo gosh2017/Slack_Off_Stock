@@ -347,8 +347,10 @@ class StockMonitorApp:
         # 监控列表相关
         self.watchlist = []        # 当前监控列表 [{code, type, name, price}]
         self._watchlist_loading = False
-        self._watchlist_visible = False  # 监控面板是否已 pack 显示
         self._context_menu = None  # 右键菜单
+
+        # 当前查询股票名称（用于 K线按钮）
+        self._current_name = ""
 
         self._build_ui()
         self._refresh_watchlist()
@@ -359,9 +361,8 @@ class StockMonitorApp:
 
     def _build_ui(self):
         self._build_input_area()
-        self._build_watchlist()
         self._build_search_results()
-        self._build_info_table()
+        self._build_watchlist()      # 监控列表，占据主体区域
         self._build_control_area()
         self._build_bottom_area()
         self._build_status_bar()
@@ -411,9 +412,11 @@ class StockMonitorApp:
     # ── 监控列表 ──
 
     def _build_watchlist(self):
+        """监控列表：占据主体区域，始终可见"""
         self.watch_frame = tk.Frame(self.root, bg="#EFEFEF",
                                     relief=tk.SUNKEN, bd=1)
-        self.watch_frame.pack_forget()
+        self.watch_frame.pack(fill=tk.BOTH, expand=True,
+                              padx=12, pady=(4, 4))
 
         # 标题行
         title_row = tk.Frame(self.watch_frame, bg="#EFEFEF")
@@ -429,14 +432,13 @@ class StockMonitorApp:
         )
         self.watch_count_label.pack(side=tk.RIGHT, padx=4)
 
-        # Treeview
+        # Treeview 容器
         tree_frame = tk.Frame(self.watch_frame, bg="#EFEFEF")
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
         columns = ("code", "type", "name", "price", "change", "time")
         self.watch_tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings",
-            height=3,
         )
 
         watch_col_defs = {
@@ -451,7 +453,12 @@ class StockMonitorApp:
             self.watch_tree.heading(col_id, text=heading)
             self.watch_tree.column(col_id, width=width, anchor=anchor)
 
-        self.watch_tree.pack(fill=tk.BOTH, expand=True)
+        # 空列表时的占位提示
+        self.watch_placeholder = tk.Label(
+            tree_frame, text="暂无监控股票，请先加入。",
+            font=("微软雅黑", 9), bg="#EFEFEF", fg="#999",
+            anchor=tk.CENTER,
+        )
 
         # 双击查询
         self.watch_tree.bind("<Double-Button-1>", self._on_select_watch)
@@ -550,16 +557,13 @@ class StockMonitorApp:
                 "--",
                 "--",
             ))
-        # 列表非空时显示面板，空列表时隐藏
+        # 面板始终显示；用 Treeview 与占位提示切换
         if self.watchlist:
-            if not self._watchlist_visible:
-                self.watch_frame.pack(
-                    fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
-                self._watchlist_visible = True
+            self.watch_placeholder.pack_forget()
+            self.watch_tree.pack(fill=tk.BOTH, expand=True)
         else:
-            if self._watchlist_visible:
-                self.watch_frame.pack_forget()
-                self._watchlist_visible = False
+            self.watch_tree.pack_forget()
+            self.watch_placeholder.pack(fill=tk.BOTH, expand=True)
 
     def _refresh_watchlist_data(self):
         """异步刷新监控列表中每只股票的最新数据"""
@@ -650,65 +654,6 @@ class StockMonitorApp:
         )
         self.search_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
         self.search_listbox.bind("<Double-Button-1>", self._on_select_search_result)
-
-    # ── 行情数据表格（紧凑表格式） ──
-
-    def _build_info_table(self):
-        table_frame = tk.Frame(self.root, bg="white",
-                               relief=tk.SUNKEN, bd=1)
-        table_frame.pack(fill=tk.BOTH, padx=12, pady=4, expand=True)
-
-        # 表头行
-        tk.Label(table_frame, text="名称 / 代码", font=FONT_LABEL,
-                 bg=COLOR_TABLE_HEADER, fg="#333", anchor=tk.W,
-                 pady=3).pack(fill=tk.X, padx=2, pady=2)
-
-        # 主数据区：网格布局（2列4行）
-        grid = tk.Frame(table_frame, bg="white")
-        grid.pack(fill=tk.BOTH, expand=True)
-
-        self.name_label = tk.Label(grid, text="--", font=("微软雅黑", 13, "bold"),
-                                   bg="white", fg="#333")
-        self.name_label.grid(row=0, column=0, columnspan=2, sticky=tk.W,
-                             padx=6, pady=(8, 2))
-
-        # 最新价 + 涨跌幅 行
-        row = tk.Frame(grid, bg="white")
-        row.grid(row=1, column=0, columnspan=2, sticky=tk.W + tk.E,
-                 padx=6, pady=(2, 4), ipady=2)
-
-        self.price_label = tk.Label(row, text="--",
-                                    font=("Consolas", 26, "bold"),
-                                    bg="white", fg=COLOR_FLAT)
-        self.price_label.pack(side=tk.LEFT)
-
-        self.change_label = tk.Label(row, text="--",
-                                     font=("Consolas", 14, "bold"),
-                                     bg="white", fg=COLOR_FLAT)
-        self.change_label.pack(side=tk.RIGHT)
-
-        # 辅助信息行
-        detail_row = tk.Frame(grid, bg="white")
-        detail_row.grid(row=2, column=0, columnspan=2, sticky=tk.W,
-                        padx=8, pady=(2, 4))
-
-        self.high_label = tk.Label(detail_row, text="高  --",
-                                   font=FONT_MONO, bg="white", fg=COLOR_INFO)
-        self.high_label.pack(side=tk.LEFT, padx=10)
-
-        self.low_label = tk.Label(detail_row, text="低  --",
-                                  font=FONT_MONO, bg="white", fg=COLOR_INFO)
-        self.low_label.pack(side=tk.LEFT, padx=10)
-
-        self.close_label = tk.Label(detail_row, text="昨收 --",
-                                    font=FONT_MONO, bg="white", fg=COLOR_INFO)
-        self.close_label.pack(side=tk.LEFT, padx=10)
-
-        self.time_label = tk.Label(grid, text="--",
-                                   font=("微软雅黑", 8),
-                                   bg="white", fg="#AAAAAA")
-        self.time_label.grid(row=3, column=0, columnspan=2, sticky=tk.W,
-                             padx=8, pady=(2, 8))
 
     # ── 控制区 ──
 
@@ -1088,7 +1033,7 @@ class StockMonitorApp:
             messagebox.showinfo("提示", "请先查询一只股票后再打开 K线窗口")
             return
         self._open_kline_window(
-            self.current_code, self.current_type, self.name_label.cget("text"))
+            self.current_code, self.current_type, self._current_name)
 
     def _on_watch_open_kline(self):
         """监控列表右键：打开选中股票的 K线窗口"""
@@ -1182,13 +1127,6 @@ class StockMonitorApp:
         stock_type = msg["type"]
 
         if data["error"]:
-            self.name_label.config(text="查询失败", fg=COLOR_INFO)
-            self.price_label.config(text="--", fg=COLOR_FLAT)
-            self.change_label.config(text="--", fg=COLOR_FLAT)
-            self.high_label.config(text="高  --")
-            self.low_label.config(text="低  --")
-            self.close_label.config(text="昨收 --")
-            self.time_label.config(text="--")
             self.status_var.set(data["error"])
             return
 
@@ -1199,34 +1137,23 @@ class StockMonitorApp:
         except Exception:
             pass
 
-        self.name_label.config(text=data["name"], fg="#333")
+        # 记录当前查询名称（供 K线按钮使用）
+        self._current_name = data["name"]
 
-        price = data["price"]
-        change = data["change_percent"]
-        yesterday_close = data["yesterday_close"]
+        # 若当前股票在监控列表中，也更新列表
+        for item in self.watchlist:
+            if item.get("code") == code and item.get("type") == stock_type:
+                item["name"] = data["name"]
+                item["price"] = data["price"]
+                break
 
-        if price > yesterday_close:
-            color = COLOR_UP
-            arrow = "+"
-        elif price < yesterday_close:
-            color = COLOR_DOWN
-            arrow = ""
-        else:
-            color = COLOR_FLAT
-            arrow = ""
-
-        self.price_label.config(text=f"{price:.2f}", fg=color)
-        self.change_label.config(
-            text=f"{arrow}{change:.2f}%", fg=color)
-
-        self.high_label.config(text=f"高  {data['high']:.2f}")
-        self.low_label.config(text=f"低  {data['low']:.2f}")
-        self.close_label.config(
-            text=f"昨收 {data['yesterday_close']:.2f}")
-        self.time_label.config(text=f"{data['date']} {data['time']}")
+        # 同步刷新监控列表显示
+        if code in {w.get("code") for w in self.watchlist}:
+            self._refresh_watchlist()
+            self._refresh_watchlist_data()
 
         self.status_var.set(
-            f"{data['name']} {data['time']}")
+            f"{data['name']}  {data['price']:.2f}  {data['change_percent']:+.2f}%  {data['time']}")
 
         # 同步悬浮窗口显示
         if self._popup_visible and self.current_code == code:
