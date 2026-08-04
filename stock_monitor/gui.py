@@ -346,8 +346,7 @@ class StockMonitorApp:
 
         # 监控列表相关
         self.watchlist = []         # 当前监控列表 [{code, type, name, price}]
-        self._watchlist_pending = 0 # 本轮未完成的查询线程数（用于复位）
-        self._watchlist_batch = 0   # 当前刷新批次号，用于丢弃过期回调
+        self._watchlist_pending = 0 # 本轮未完成的查询线程数（用于复位状态栏）
         self._context_menu = None   # 右键菜单
 
         # 当前查询股票名称（用于 K线按钮）
@@ -570,33 +569,25 @@ class StockMonitorApp:
         """异步刷新监控列表中每只股票的最新数据"""
         if not self.watchlist:
             return
-        # 递增批次号，让旧批次的回调能够自我丢弃
-        self._watchlist_batch += 1
-        batch = self._watchlist_batch
         self._watchlist_pending = len(self.watchlist)
         self.status_var.set(f"刷新监控列表（{self._watchlist_pending}只）...")
         for item in self.watchlist:
             threading.Thread(
                 target=self._watchlist_fetch_thread,
-                args=(batch, item["code"], item.get("type", "stock")),
+                args=(item["code"], item.get("type", "stock")),
                 daemon=True,
             ).start()
 
-    def _watchlist_fetch_thread(self, batch, code, stock_type):
+    def _watchlist_fetch_thread(self, code, stock_type):
         """后台线程：获取监控列表中一只股票的行情"""
         data = query_stock(code, stock_type)
         self.data_queue.put({"_watchlist_refresh": True,
-                             "_batch": batch,
                              "code": code,
                              "type": stock_type,
                              "data": data})
 
     def _update_watchlist_display(self, msg):
-        """监控列表数据更新：更新 Treeview 行"""
-        # 丢弃过期批次的回调
-        if msg.get("_batch", 0) != self._watchlist_batch:
-            return
-
+        """监控列表数据更新：更新 Treeview 行（直接更新，不检查批次）"""
         code = msg["code"]
         stock_type = msg["type"]
         data = msg["data"]
@@ -632,9 +623,6 @@ class StockMonitorApp:
                             wi["name"] = name
                             wi["price"] = price
                             break
-                    # 若当前正在查询的就是这只，同步详情
-                    if self.current_code == code and self.current_type == stock_type:
-                        self._update_display(msg)
                 break
         # 一个线程完成，计数递减；归零时表示本轮全部完成
         self._watchlist_pending -= 1
@@ -642,6 +630,38 @@ class StockMonitorApp:
             self._watchlist_pending = 0
             self.status_var.set(
                 f"监控列表：{len(self.watchlist)} 只股票")
+
+    def _update_watchlist_row_sync(self, code, stock_type, data):
+        """同步更新监控列表中当前股票的那一行（不触发新刷新批次）"""
+        # 更新内存中的数据
+        for item in self.watchlist:
+            if item.get("code") == code and item.get("type") == stock_type:
+                item["name"] = data["name"]
+                item["price"] = data["price"]
+                break
+
+        # 直接更新 Treeview 对应行
+        type_label = _TYPE_LABEL.get(stock_type, "股票")
+        for item_id in self.watch_tree.get_children():
+            values = self.watch_tree.item(item_id, "values")
+            if values[0] == code:
+                if data["error"]:
+                    self.watch_tree.item(item_id, values=(
+                        code, type_label, "--", "--", "--", "--",
+                    ))
+                else:
+                    price = data["price"]
+                    change = data["change_percent"]
+                    name = data.get("name", "")
+                    time_str = f"{data.get('time', '--')}"
+                    change_str = f"{change:+.2f}%"
+                    self.watch_tree.item(item_id, values=(
+                        code, type_label, name,
+                        f"{price:.2f}",
+                        change_str,
+                        time_str,
+                    ))
+                break
 
     def _build_search_results(self):
         self.search_frame = tk.Frame(self.root, bg=COLOR_SEARCH_BG,
@@ -1144,17 +1164,8 @@ class StockMonitorApp:
         # 记录当前查询名称（供 K线按钮使用）
         self._current_name = data["name"]
 
-        # 若当前股票在监控列表中，也更新列表
-        for item in self.watchlist:
-            if item.get("code") == code and item.get("type") == stock_type:
-                item["name"] = data["name"]
-                item["price"] = data["price"]
-                break
-
-        # 同步刷新监控列表显示
-        if code in {w.get("code") for w in self.watchlist}:
-            self._refresh_watchlist()
-            self._refresh_watchlist_data()
+        # 若当前股票在监控列表中，直接更新该行（不触发新批次，不打断正常刷新）
+        self._update_watchlist_row_sync(code, stock_type, data)
 
         self.status_var.set(
             f"{data['name']}  {data['price']:.2f}  {data['change_percent']:+.2f}%  {data['time']}")
