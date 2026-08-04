@@ -697,7 +697,7 @@ class StockMonitorApp:
         self.interval_spin.pack(side=tk.LEFT, padx=2)
 
         self.start_btn = tk.Button(
-            ctrl_frame, text="开始", font=FONT_BTN, width=6,
+            ctrl_frame, text="开始刷新", font=FONT_BTN, width=6,
             bg="#E0E0E0", fg="#333", command=self._on_start_refresh,
         )
         self.start_btn.pack(side=tk.LEFT, padx=2)
@@ -867,35 +867,25 @@ class StockMonitorApp:
         self.status_var.set("历史已清空")
 
     def _on_start_refresh(self):
-        code = self.code_entry.get().strip()
-        if not code:
-            messagebox.showwarning("提示", "请先输入代码")
+        if not self.watchlist:
+            messagebox.showinfo("提示", "监控列表为空，请先加入股票")
             return
-        if not code.isdigit():
-            messagebox.showwarning("提示", "代码必须为纯数字")
-            return
-
-        type_map = {"股票": "stock", "指数": "index", "ETF": "etf"}
-        self.current_type = type_map.get(self.type_var.get(), "stock")
-        self.current_code = code
 
         try:
             interval = int(self.interval_var.get())
             if interval < 5:
                 interval = 5
-            self.refresh_interval = interval
         except ValueError:
-            self.refresh_interval = 60
+            interval = 60
+        self.refresh_interval = interval
 
         self.auto_refresh = True
-        for w in (self.start_btn, self.query_btn, self.code_entry,
-                  self.interval_spin, self.type_combo, self.search_btn):
+        for w in (self.start_btn, self.interval_spin,):
             w.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
 
-        type_label = self.type_var.get()
         self.status_var.set(
-            f"自动刷新 {self.refresh_interval}s — {type_label}: {code}")
+            f"自动刷新 {self.refresh_interval}s — 监控列表：{len(self.watchlist)} 只股票")
         self._schedule_refresh()
 
     def _on_stop_refresh(self):
@@ -903,8 +893,7 @@ class StockMonitorApp:
         if self.after_id:
             self.root.after_cancel(self.after_id)
             self.after_id = None
-        for w in (self.start_btn, self.query_btn, self.code_entry,
-                  self.interval_spin, self.type_combo, self.search_btn):
+        for w in (self.start_btn, self.interval_spin,):
             w.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_var.set("自动刷新已停止")
@@ -1134,10 +1123,7 @@ class StockMonitorApp:
     def _schedule_refresh(self):
         if not self.auto_refresh:
             return
-        threading.Thread(target=self._fetch_data_thread,
-                         args=(self.current_code, self.current_type),
-                         daemon=True).start()
-        # 同时刷新监控列表
+        # 刷新监控列表中所有股票
         self._refresh_watchlist_data()
         self.after_id = self.root.after(
             self.refresh_interval * 1000, self._schedule_refresh)
