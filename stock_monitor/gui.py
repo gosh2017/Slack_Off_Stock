@@ -345,9 +345,10 @@ class StockMonitorApp:
         # K线图嵌入相关（已移至独立 KlineWindow，不再使用）
 
         # 监控列表相关
-        self.watchlist = []        # 当前监控列表 [{code, type, name, price}]
-        self._watchlist_loading = False
-        self._context_menu = None  # 右键菜单
+        self.watchlist = []         # 当前监控列表 [{code, type, name, price}]
+        self._watchlist_pending = 0 # 本轮未完成的查询线程数（用于复位）
+        self._watchlist_batch = 0   # 当前刷新批次号，用于丢弃过期回调
+        self._context_menu = None   # 右键菜单
 
         # 当前查询股票名称（用于 K线按钮）
         self._current_name = ""
@@ -567,29 +568,35 @@ class StockMonitorApp:
 
     def _refresh_watchlist_data(self):
         """异步刷新监控列表中每只股票的最新数据"""
-        if self._watchlist_loading:
-            return
         if not self.watchlist:
             return
-        self._watchlist_loading = True
-        self.status_var.set(f"刷新监控列表（{len(self.watchlist)}只）...")
+        # 递增批次号，让旧批次的回调能够自我丢弃
+        self._watchlist_batch += 1
+        batch = self._watchlist_batch
+        self._watchlist_pending = len(self.watchlist)
+        self.status_var.set(f"刷新监控列表（{self._watchlist_pending}只）...")
         for item in self.watchlist:
             threading.Thread(
                 target=self._watchlist_fetch_thread,
-                args=(item["code"], item.get("type", "stock")),
+                args=(batch, item["code"], item.get("type", "stock")),
                 daemon=True,
             ).start()
 
-    def _watchlist_fetch_thread(self, code, stock_type):
+    def _watchlist_fetch_thread(self, batch, code, stock_type):
         """后台线程：获取监控列表中一只股票的行情"""
         data = query_stock(code, stock_type)
         self.data_queue.put({"_watchlist_refresh": True,
+                             "_batch": batch,
                              "code": code,
                              "type": stock_type,
                              "data": data})
 
     def _update_watchlist_display(self, msg):
         """监控列表数据更新：更新 Treeview 行"""
+        # 丢弃过期批次的回调
+        if msg.get("_batch", 0) != self._watchlist_batch:
+            return
+
         code = msg["code"]
         stock_type = msg["type"]
         data = msg["data"]
@@ -629,15 +636,12 @@ class StockMonitorApp:
                     if self.current_code == code and self.current_type == stock_type:
                         self._update_display(msg)
                 break
-        # 所有项处理完毕后解除锁定
-        self.root.after(10, self._maybe_finish_watchlist_refresh)
-
-    def _maybe_finish_watchlist_refresh(self):
-        """检查是否所有监控项都已刷新完毕"""
-        self._watchlist_loading = False
-        self.status_var.set(
-            f"监控列表：{len(self.watchlist)} 只股票"
-        )
+        # 一个线程完成，计数递减；归零时表示本轮全部完成
+        self._watchlist_pending -= 1
+        if self._watchlist_pending <= 0:
+            self._watchlist_pending = 0
+            self.status_var.set(
+                f"监控列表：{len(self.watchlist)} 只股票")
 
     def _build_search_results(self):
         self.search_frame = tk.Frame(self.root, bg=COLOR_SEARCH_BG,
