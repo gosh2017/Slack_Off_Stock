@@ -117,8 +117,8 @@ python -m stock_monitor.main
 │   └── watchlist.json         # 监控列表
 ├── stock_monitor/             # 主程序包
 │   ├── main.py                # 程序入口
-│   ├── gui.py                 # GUI 主界面（含 K线独立窗口实现）
-│   ├── kline_chart.py         # K线图模块（matplotlib 绘制）
+│   ├── gui.py                 # GUI 主界面（含监控列表、查询、K线独立窗口、悬浮窗等）
+│   ├── kline_chart.py         # K线图模块（matplotlib 绘制，含 NavigationToolbar，当前为备用版本）
 │   ├── stock_api.py           # 数据获取模块（新浪财经 API）
 │   ├── stock_search.py        # 名称搜索模块
 │   ├── history_manager.py     # 查询历史管理（JSON 持久化）
