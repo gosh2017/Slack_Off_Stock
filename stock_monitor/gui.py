@@ -14,7 +14,39 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import queue
+import ctypes
 from datetime import datetime
+
+# ──────────────── Windows 分层窗口 API ────────────────
+# 用于悬浮窗口的半透明背景（LWA_ALPHA），避免 -transparentcolor
+# 的抗锯齿灰色像素残留导致文字边缘锯齿。
+_USER32 = ctypes.windll.user32
+_GETDC = _USER32.GetDC
+_RELEASEDC = _USER32.ReleaseDC
+_SETWINLONG = _USER32.SetWindowLongW
+_GETWINLONG = _USER32.GetWindowLongW
+_SETLAYEREDATTR = _USER32.SetLayeredWindowAttributes
+_UPDATELAYEREDWIN = _USER32.UpdateLayeredWindow
+_WS_EX_LAYERED = 0x00080000
+_WS_EX_TRANSPARENT = 0x00000020
+_GWL_EXSTYLE = -20
+_LWA_ALPHA = 0x00000002
+
+
+def _set_layered_alpha(hwnd: int, alpha: int = 200) -> None:
+    """
+    给窗口设置分层半透明效果（LWA_ALPHA）。
+
+    与 -transparentcolor 不同，LWA_ALPHA 对整个窗口做统一 alpha 合成，
+    文字始终绘制在实心底色上，不会出现抗锯齿灰色边缘残留。
+
+    参数:
+        hwnd: 窗口句柄
+        alpha: 不透明度 0(全透明)~255(不透明)，默认 200
+    """
+    style = _GETWINLONG(hwnd, _GWL_EXSTYLE)
+    _SETWINLONG(hwnd, _GWL_EXSTYLE, style | _WS_EX_LAYERED | _WS_EX_TRANSPARENT)
+    _SETLAYEREDATTR(hwnd, 0, alpha, _LWA_ALPHA)
 
 from stock_monitor.stock_api import query_stock, query_kline_data
 from stock_monitor.stock_search import search_stocks
@@ -902,10 +934,12 @@ class StockMonitorApp:
         self.root.attributes("-topmost", self.topmost_var.get())
 
     # ──────────────── 悬浮文字框 ────────────────
-    # 无边框置顶窗口，用 -transparentcolor 背景透明。
-    # 黑底 + 白字，抗锯齿边缘为灰色像素，不会出现白边。
+    # 无边框置顶窗口，用 LWA_ALPHA（分层窗口）实现整体半透明。
+    # 与 -transparentcolor 不同：文字始终绘制在实心底色上，
+    # 整窗口再统一 alpha 合成到桌面，不会产生抗锯齿灰色边缘残留。
 
-    _POPUP_BG = "#000000"  # 透明占位色（黑底，抗锯齿边缘为灰，不显眼）
+    _POPUP_BG = "#1A1A1A"     # 深灰半透明底色
+    _POPUP_ALPHA = 200        # 整窗口不透明度 0~255
 
     def _toggle_popup(self):
         if not self.current_code:
@@ -928,33 +962,33 @@ class StockMonitorApp:
         # 位置：桌面右下角（留 20px 边距）
         sw = self._popup_window.winfo_screenwidth()
         sh = self._popup_window.winfo_screenheight()
-        self._popup_window.geometry(f"160x80+{sw-100}+{sh-200}")
+        self._popup_window.geometry(f"180x80+{sw-120}+{sh-200}")
 
-        # 容器
+        # 容器（带 1px 深边框，提升层次感）
         container = tk.Frame(self._popup_window, relief=tk.FLAT, bd=0,
                              bg=self._POPUP_BG)
-        container.pack(fill=tk.BOTH, expand=True)
+        container.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
         # 名称（白字）
         self.popup_name_label = tk.Label(
             container, text="--", font=("微软雅黑", 10, "bold"),
             fg="#FFFFFF", bg=self._POPUP_BG,
             borderwidth=0, highlightthickness=0)
-        self.popup_name_label.pack(anchor=tk.W, padx=4, pady=(2, 0))
+        self.popup_name_label.pack(anchor=tk.W, padx=6, pady=(3, 0))
 
         # 价格（白字）
         self.popup_price_label = tk.Label(
-            container, text="--", font=("Consolas", 18, "bold"),
+            container, text="--", font=("Consolas", 20, "bold"),
             fg="#FFFFFF", bg=self._POPUP_BG,
             borderwidth=0, highlightthickness=0)
-        self.popup_price_label.pack(anchor=tk.W, padx=4, pady=(0, 0))
+        self.popup_price_label.pack(anchor=tk.W, padx=6, pady=(0, 0))
 
         # 涨跌幅（白字）
         self.popup_change_label = tk.Label(
             container, text="--", font=("Consolas", 11, "bold"),
             fg="#FFFFFF", bg=self._POPUP_BG,
             borderwidth=0, highlightthickness=0)
-        self.popup_change_label.pack(anchor=tk.W, padx=4, pady=(0, 2))
+        self.popup_change_label.pack(anchor=tk.W, padx=6, pady=(0, 3))
 
         # 拖拽
         self._drag_x = 0
@@ -965,10 +999,11 @@ class StockMonitorApp:
             w.bind("<ButtonPress-1>", self._on_popup_press)
             w.bind("<B1-Motion>", self._on_popup_motion)
 
-        # 透明化（延迟应用，确保窗口已渲染）
-        self._popup_window.after_idle(
-            lambda: self._popup_window.wm_attributes(
-                "-transparentcolor", self._POPUP_BG))
+        # 分层窗口 alpha 合成（不依赖 -transparentcolor）
+        # 文字绘制在实心底色上，整窗口再做统一 alpha 合成，
+        # 彻底消除抗锯齿灰色边缘残留问题。
+        hwnd = int(str(self._popup_window.winfo_id()), 16)
+        self._popup_window.after_idle(lambda: _set_layered_alpha(hwnd, self._POPUP_ALPHA))
 
         self._popup_visible = True
         self.popup_btn.config(text="隐藏", bg="#F5B7B1")
