@@ -14,43 +14,11 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import queue
-import ctypes
-from datetime import datetime
-
-# ──────────────── Windows 分层窗口 API ────────────────
-# 用于悬浮窗口的半透明背景（LWA_ALPHA），避免 -transparentcolor
-# 的抗锯齿灰色像素残留导致文字边缘锯齿。
-_USER32 = ctypes.windll.user32
-_GETDC = _USER32.GetDC
-_RELEASEDC = _USER32.ReleaseDC
-_SETWINLONG = _USER32.SetWindowLongW
-_GETWINLONG = _USER32.GetWindowLongW
-_SETLAYEREDATTR = _USER32.SetLayeredWindowAttributes
-_UPDATELAYEREDWIN = _USER32.UpdateLayeredWindow
-_WS_EX_LAYERED = 0x00080000
-_WS_EX_TRANSPARENT = 0x00000020
-_GWL_EXSTYLE = -20
-_LWA_ALPHA = 0x00000002
-
-
-def _set_layered_alpha(hwnd: int, alpha: int = 200) -> None:
-    """
-    给窗口设置分层半透明效果（LWA_ALPHA）。
-
-    与 -transparentcolor 不同，LWA_ALPHA 对整个窗口做统一 alpha 合成，
-    文字始终绘制在实心底色上，不会出现抗锯齿灰色边缘残留。
-
-    参数:
-        hwnd: 窗口句柄
-        alpha: 不透明度 0(全透明)~255(不透明)，默认 200
-    """
-    style = _GETWINLONG(hwnd, _GWL_EXSTYLE)
-    _SETWINLONG(hwnd, _GWL_EXSTYLE, style | _WS_EX_LAYERED | _WS_EX_TRANSPARENT)
-    _SETLAYEREDATTR(hwnd, 0, alpha, _LWA_ALPHA)
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from stock_monitor.stock_api import query_stock, query_kline_data
 from stock_monitor.stock_search import search_stocks
-from stock_monitor.history_manager import save_query, load_history, clear_history
+from stock_monitor.history_manager import save_query, load_history, clear_history, remove_history_record
 from stock_monitor.watchlist_manager import (
     load_watchlist, add_to_watchlist,
     remove_from_watchlist, is_in_watchlist,
@@ -359,7 +327,7 @@ class StockMonitorApp:
 
         # 自动刷新
         self.auto_refresh = False
-        self.refresh_interval = 60
+        self.refresh_interval = 30
         self.after_id = None
 
         # 当前查询信息
@@ -720,7 +688,7 @@ class StockMonitorApp:
         tk.Label(ctrl_frame, text="刷新:", font=FONT_LABEL,
                  bg=COLOR_BG).pack(side=tk.LEFT)
 
-        self.interval_var = tk.StringVar(value="60")
+        self.interval_var = tk.StringVar(value="30")
         self.interval_spin = tk.Spinbox(
             ctrl_frame, from_=5, to=600, increment=5, width=4,
             textvariable=self.interval_var, font=FONT_MONO_SM,
@@ -810,6 +778,7 @@ class StockMonitorApp:
 
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.history_tree.bind("<Double-Button-1>", self._on_select_history)
+        self.history_tree.bind("<Button-3>", self._on_history_right_click)
 
     # ── 状态栏 ──
 
@@ -898,6 +867,36 @@ class StockMonitorApp:
         self._refresh_history_table()
         self.status_var.set("历史已清空")
 
+    def _on_history_right_click(self, event):
+        """历史记录右键：弹出菜单，移除指定条目"""
+        row = self.history_tree.identify_row(event.y)
+        if not row:
+            return
+        self.history_tree.selection_set(row)
+        menu = tk.Menu(self.root, tearoff=False)
+        menu.add_command(
+            label="移除",
+            command=self._on_remove_history_item,
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_remove_history_item(self):
+        """从历史记录中移除当前选中的条目"""
+        sel = self.history_tree.selection()
+        if not sel:
+            return
+        values = self.history_tree.item(sel[0], "values")
+        code = values[0]
+        type_label = values[1]
+        type_map = {"股票": "stock", "指数": "index", "ETF": "etf"}
+        stock_type = type_map.get(type_label, "stock")
+
+        if not messagebox.askyesno("确认", f"确定从历史中移除 {code} 的记录？"):
+            return
+        remove_history_record(code, stock_type)
+        self._refresh_history_table()
+        self.status_var.set(f"已移除历史记录 {code}")
+
     def _on_start_refresh(self):
         if not self.watchlist:
             messagebox.showinfo("提示", "监控列表为空，请先加入股票")
@@ -934,12 +933,46 @@ class StockMonitorApp:
         self.root.attributes("-topmost", self.topmost_var.get())
 
     # ──────────────── 悬浮文字框 ────────────────
-    # 无边框置顶窗口，用 LWA_ALPHA（分层窗口）实现整体半透明。
-    # 与 -transparentcolor 不同：文字始终绘制在实心底色上，
-    # 整窗口再统一 alpha 合成到桌面，不会产生抗锯齿灰色边缘残留。
+    # 无边框置顶窗口，用 -transparentcolor 实现透明背景。
+    # 文字用 PIL 渲染深色轮廓（outline），确保在任何彩色背景上都清晰可读。
 
-    _POPUP_BG = "#1A1A1A"     # 深灰半透明底色
-    _POPUP_ALPHA = 200        # 整窗口不透明度 0~255
+    _POPUP_BG = "#000000"     # 透明占位色（-transparentcolor 会精确匹配此色）
+
+    _FONT_PATHS = {
+        "微软雅黑": "C:/Windows/Fonts/msyh.ttc",
+        "Consolas": "C:/Windows/Fonts/consola.ttf",
+    }
+
+    def _render_label_image(self, text, font_name, font_size, text_color,
+                            outline_color="#1A1A1A"):
+        """用 PIL 渲染文字+深色轮廓，返回 PhotoImage（透明背景上的清晰文字）。"""
+        font_path = self._FONT_PATHS.get(font_name, "")
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        bbox = font.getbbox(text)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+
+        pad = 7
+        img = Image.new("RGBA", (text_w + pad * 2, text_h + pad * 2),
+                        (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # 1px 深色轮廓（8 方向），确保文字在任何背景上都清晰可读
+        offsets = [(-1, -1), (-1, 0), (-1, 1),
+                   (0, -1),           (0, 1),
+                   (1, -1),  (1, 0),  (1, 1)]
+        for dx, dy in offsets:
+            draw.text((pad + bbox[0] + dx, pad + bbox[1] + dy),
+                      text, font=font, fill=outline_color)
+        # 主文字居上
+        draw.text((pad + bbox[0], pad + bbox[1]),
+                  text, font=font, fill=text_color)
+
+        return ImageTk.PhotoImage(img)
 
     def _toggle_popup(self):
         if not self.current_code:
@@ -964,30 +997,32 @@ class StockMonitorApp:
         sh = self._popup_window.winfo_screenheight()
         self._popup_window.geometry(f"180x80+{sw-120}+{sh-200}")
 
-        # 容器（带 1px 深边框，提升层次感）
         container = tk.Frame(self._popup_window, relief=tk.FLAT, bd=0,
                              bg=self._POPUP_BG)
-        container.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        container.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
 
-        # 名称（白字）
+        # 名称（PIL 渲染白字 + 深色轮廓，确保透明背景上清晰可读）
+        name_img = self._render_label_image("--", "微软雅黑", 14, "#FFFFFF")
         self.popup_name_label = tk.Label(
-            container, text="--", font=("微软雅黑", 10, "bold"),
-            fg="#FFFFFF", bg=self._POPUP_BG,
+            container, image=name_img, bg=self._POPUP_BG,
             borderwidth=0, highlightthickness=0)
+        self.popup_name_label.photo = name_img
         self.popup_name_label.pack(anchor=tk.W, padx=6, pady=(3, 0))
 
-        # 价格（白字）
+        # 价格（PIL 渲染）
+        price_img = self._render_label_image("--", "Consolas", 20, "#FFFFFF")
         self.popup_price_label = tk.Label(
-            container, text="--", font=("Consolas", 20, "bold"),
-            fg="#FFFFFF", bg=self._POPUP_BG,
+            container, image=price_img, bg=self._POPUP_BG,
             borderwidth=0, highlightthickness=0)
+        self.popup_price_label.photo = price_img
         self.popup_price_label.pack(anchor=tk.W, padx=6, pady=(0, 0))
 
-        # 涨跌幅（白字）
+        # 涨跌幅（PIL 渲染）
+        change_img = self._render_label_image("--", "Consolas", 14, "#FFFFFF")
         self.popup_change_label = tk.Label(
-            container, text="--", font=("Consolas", 11, "bold"),
-            fg="#FFFFFF", bg=self._POPUP_BG,
+            container, image=change_img, bg=self._POPUP_BG,
             borderwidth=0, highlightthickness=0)
+        self.popup_change_label.photo = change_img
         self.popup_change_label.pack(anchor=tk.W, padx=6, pady=(0, 3))
 
         # 拖拽
@@ -999,11 +1034,10 @@ class StockMonitorApp:
             w.bind("<ButtonPress-1>", self._on_popup_press)
             w.bind("<B1-Motion>", self._on_popup_motion)
 
-        # 分层窗口 alpha 合成（不依赖 -transparentcolor）
-        # 文字绘制在实心底色上，整窗口再做统一 alpha 合成，
-        # 彻底消除抗锯齿灰色边缘残留问题。
-        hwnd = int(str(self._popup_window.winfo_id()), 16)
-        self._popup_window.after_idle(lambda: _set_layered_alpha(hwnd, self._POPUP_ALPHA))
+        # 透明化：将纯黑背景设为透明，文字轮廓保留，清晰可见
+        self._popup_window.after_idle(
+            lambda: self._popup_window.wm_attributes(
+                "-transparentcolor", self._POPUP_BG))
 
         self._popup_visible = True
         self.popup_btn.config(text="隐藏", bg="#F5B7B1")
@@ -1056,9 +1090,15 @@ class StockMonitorApp:
         if self._popup_window is None:
             return
         if data["error"]:
-            self.popup_name_label.config(text="查询失败", fg=COLOR_INFO)
-            self.popup_price_label.config(text="--", fg="#FFFFFF")
-            self.popup_change_label.config(text="--", fg="#FFFFFF")
+            name_img = self._render_label_image("查询失败", "微软雅黑", 14, "#FFCC00")
+            self.popup_name_label.config(image=name_img)
+            self.popup_name_label.photo = name_img
+            img = self._render_label_image("--", "Consolas", 20, "#FFFFFF")
+            self.popup_price_label.config(image=img)
+            self.popup_price_label.photo = img
+            img = self._render_label_image("--", "Consolas", 14, "#FFFFFF")
+            self.popup_change_label.config(image=img)
+            self.popup_change_label.photo = img
             return
         price = data["price"]
         change = data["change_percent"]
@@ -1069,9 +1109,15 @@ class StockMonitorApp:
             color = "#00CC00"
         else:
             color = "#FFFFFF"
-        self.popup_name_label.config(text=data["name"], fg="#FFFFFF")
-        self.popup_price_label.config(text=f"{price:.2f}", fg=color)
-        self.popup_change_label.config(text=f"{change:+.2f}%", fg=color)
+        name_img = self._render_label_image(data["name"], "微软雅黑", 14, "#FFFFFF")
+        self.popup_name_label.config(image=name_img)
+        self.popup_name_label.photo = name_img
+        price_img = self._render_label_image(f"{price:.2f}", "Consolas", 20, color)
+        self.popup_price_label.config(image=price_img)
+        self.popup_price_label.photo = price_img
+        change_img = self._render_label_image(f"{change:+.2f}%", "Consolas", 14, color)
+        self.popup_change_label.config(image=change_img)
+        self.popup_change_label.photo = change_img
 
     # ──────────────── K线窗口 ────────────────
 

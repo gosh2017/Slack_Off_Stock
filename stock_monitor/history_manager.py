@@ -117,6 +117,24 @@ def save_query(code: str, stock_type: str, data: dict) -> list[dict]:
     return deduped
 
 
+def remove_history_record(code: str, stock_type: str) -> list[dict]:
+    """
+    从历史记录中移除指定股票（code + type）的条目。
+
+    参数：
+        code:       股票代码
+        stock_type: 类型（stock / index / etf）
+
+    返回：
+        更新后的完整历史记录列表
+    """
+    history = load_history()
+    history = [r for r in history
+               if not (r["code"] == code and r["type"] == stock_type)]
+    save_history(history)
+    return history
+
+
 def clear_history() -> None:
     """清空查询历史"""
     path = _history_path()
