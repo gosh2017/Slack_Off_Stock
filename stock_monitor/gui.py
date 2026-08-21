@@ -314,9 +314,9 @@ class StockMonitorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("行情")
-        self.root.geometry("480x640")
+        self.root.geometry("480x420")
         self.root.resizable(True, True)
-        self.root.minsize(400, 500)
+        self.root.minsize(400, 380)
         self.root.configure(bg=COLOR_BG)
 
         # 可选：窗口置顶
@@ -729,30 +729,48 @@ class StockMonitorApp:
         )
         self.kline_btn.pack(side=tk.LEFT, padx=4)
 
-    # ── 底部区域（历史记录） ──
+    # ── 底部区域（历史记录，可折叠） ──
 
     def _build_bottom_area(self):
-        """底部：历史记录"""
-        self.bottom_notebook = ttk.Notebook(self.root)
-        self.bottom_notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(2, 0))
+        """底部：历史记录（可折叠栏，默认折叠）"""
+        self.bottom_frame = tk.Frame(self.root, bg=COLOR_BG)
+        self.bottom_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(2, 0))
 
-        # ── Tab: 历史记录 ──
-        history_frame = tk.Frame(self.bottom_notebook, bg=COLOR_BG)
-        self.bottom_notebook.add(history_frame, text="历史")
-        self._build_history_tab(history_frame)
+        self.history_collapsed = True  # 默认折叠
 
-    def _build_history_tab(self, parent):
-        """构建历史记录 tab"""
-        tk.Label(parent, text="查询历史（双击重查）：",
+        # 折叠标题栏
+        header = tk.Frame(self.bottom_frame, bg=COLOR_BG)
+        header.pack(fill=tk.X)
+
+        self.history_toggle_btn = tk.Button(
+            header, text="▲  查询历史", font=FONT_LABEL,
+            bg="#E8E8E8", fg="#333", relief=tk.FLAT,
+            command=self._toggle_history_panel,
+        )
+        self.history_toggle_btn.pack(side=tk.LEFT)
+
+        self._build_history_content()
+
+    def _build_history_content(self):
+        """构建历史记录内容（初始隐藏）"""
+        self.history_content = tk.Frame(self.bottom_frame, bg=COLOR_BG)
+
+        content_frame = tk.Frame(self.history_content, bg=COLOR_BG)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+
+        top_row = tk.Frame(content_frame, bg=COLOR_BG)
+        top_row.pack(fill=tk.X, pady=(0, 2))
+
+        tk.Label(top_row, text="查询历史（双击重查）：",
                  font=FONT_LABEL, bg=COLOR_BG, fg="#333"
-                 ).pack(anchor=tk.W, padx=4, pady=(4, 0))
+                 ).pack(side=tk.LEFT)
 
-        tk.Button(parent, text="清空", font=FONT_BTN,
+        tk.Button(top_row, text="清空", font=FONT_BTN,
                   bg="#E0E0E0", fg="#333", command=self._on_clear_history
-                  ).pack(anchor=tk.E, padx=4, pady=(0, 2))
+                  ).pack(side=tk.RIGHT)
 
-        tree_frame = tk.Frame(parent, bg=COLOR_BG)
-        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        tree_frame = tk.Frame(content_frame, bg=COLOR_BG)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -760,7 +778,7 @@ class StockMonitorApp:
         columns = ("code", "type", "name", "price", "change", "time")
         self.history_tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings",
-            height=5, yscrollcommand=scrollbar.set,
+            height=4, yscrollcommand=scrollbar.set,
         )
         scrollbar.config(command=self.history_tree.yview)
 
@@ -779,6 +797,24 @@ class StockMonitorApp:
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.history_tree.bind("<Double-Button-1>", self._on_select_history)
         self.history_tree.bind("<Button-3>", self._on_history_right_click)
+
+    def _toggle_history_panel(self):
+        """切换历史记录面板的折叠/展开状态"""
+        self._set_history_visibility(self.history_collapsed)
+
+    def _set_history_visibility(self, visible: bool):
+        """设置历史记录面板可见性"""
+        self.history_collapsed = not visible
+        if visible:
+            self.history_content.pack(fill=tk.BOTH, expand=True)
+            self.history_toggle_btn.config(text="▼  查询历史")
+            self.root.geometry("480x620")
+        else:
+            self.history_content.pack_forget()
+            self.history_toggle_btn.config(text="▲  查询历史")
+            self.root.geometry("480x420")
+        self.root.minsize(400, 380)
+        self.root.update_idletasks()
 
     # ── 状态栏 ──
 
@@ -907,7 +943,7 @@ class StockMonitorApp:
             if interval < 5:
                 interval = 5
         except ValueError:
-            interval = 60
+            interval = 30
         self.refresh_interval = interval
 
         self.auto_refresh = True
