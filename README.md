@@ -125,8 +125,24 @@ python -m stock_monitor.main
 │   ├── watchlist_manager.py   # 监控列表管理（JSON 持久化）
 │   ├── config.py              # 共享配置（请求头、超时等）
 │   └── __init__.py            # 包入口
+├── tests/                     # 单元测试（pytest）
+│   ├── conftest.py            # 测试配置（将项目根目录加入 sys.path）
+│   ├── test_stock_api.py      # 代码前缀 / 行情解析 / K线聚合 / 网络异常
+│   ├── test_history_manager.py # 查询历史读写与去重
+│   ├── test_watchlist_manager.py # 监控列表读写与去重
+│   └── test_stock_search.py   # 名称搜索解析与过滤
+├── pytest.ini                 # pytest 配置
 └── .gitignore
 ```
+
+## 运行测试
+
+```bash
+pip install pytest
+pytest
+```
+
+测试全部使用 mock 替代真实网络请求，不会访问新浪接口，也不会读写 `config/` 下的真实数据文件。
 
 ## 常见问题
 
