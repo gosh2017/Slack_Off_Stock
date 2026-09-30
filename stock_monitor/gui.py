@@ -327,7 +327,7 @@ class StockMonitorApp:
 
         # 自动刷新
         self.auto_refresh = False
-        self.refresh_interval = 30
+        self.refresh_interval = 10
         self.after_id = None
 
         # 当前查询信息
@@ -688,7 +688,7 @@ class StockMonitorApp:
         tk.Label(ctrl_frame, text="刷新:", font=FONT_LABEL,
                  bg=COLOR_BG).pack(side=tk.LEFT)
 
-        self.interval_var = tk.StringVar(value="30")
+        self.interval_var = tk.StringVar(value="10")
         self.interval_spin = tk.Spinbox(
             ctrl_frame, from_=5, to=600, increment=5, width=4,
             textvariable=self.interval_var, font=FONT_MONO_SM,
@@ -943,7 +943,7 @@ class StockMonitorApp:
             if interval < 5:
                 interval = 5
         except ValueError:
-            interval = 30
+            interval = 10
         self.refresh_interval = interval
 
         self.auto_refresh = True
