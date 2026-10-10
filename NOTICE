@@ -1,0 +1,35 @@
+股票行情监控工具 — 第三方组件授权声明
+=========================================
+
+Apache 2.0 第 4(d) 条要求随附本声明。完整的许可证正文见本目录的 LICENSE。
+
+---------------------------------------------------------------
+
+HQChart（开源版）
+----------------
+
+    用途        K线图渲染（蜡烛图、均线、成交量、指标、十字光标、缩放平移）
+    原始仓库    https://github.com/jones2000/HQChart
+    作者        jones <jones_2000@163.com>
+    版权        Copyright (c) 2018 jones
+    许可证      Apache License 2.0（见本目录的 LICENSE）
+
+本项目用到的文件（位于 stock_monitor/assets/hqchart/hqchart/）：
+
+    umychart.js               封装行情类图形控件 (H5版本)
+    umychart.complier.js      分析家语法编译执行器 (H5版本)
+    umychart.index.data.js    系统指标 (H5版本)
+
+使用方式：三个文件均为原样复制，**未做任何修改**，文件头部自带的版权声明已保留。
+本项目与 HQChart 之间的全部适配逻辑在
+stock_monitor/assets/hqchart/chart_bridge.js，没有改动 hqchart/ 下的任何一行。
+
+---------------------------------------------------------------
+
+关于本文件中许可证的范围
+
+本目录的 LICENSE 是 Apache License 2.0 的正文，用于上述 HQChart 组件的
+再分发（Apache 2.0 第 4(a) 条要求在分发时向接收方提供许可证副本）。
+
+本项目自有代码（stock_monitor/ 下的 Python 源码、tests/ 等）的许可证
+未在本文件中声明。

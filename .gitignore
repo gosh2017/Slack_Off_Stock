@@ -151,3 +151,10 @@ config/
 # Packaged production artifacts (large binaries)
 production/
 *.exe
+
+# build_exe.py 构建第三方许可证时用的暂存目录，构建结束自动删除
+.stage/
+
+# HQChart 开源版（Apache 2.0）的三个 JS 文件已随仓库分发在
+# stock_monitor/assets/hqchart/hqchart/ 下（约 5MB），请勿排除该目录；
+# 版权与授权说明见该目录的 NOTICE

@@ -109,6 +109,61 @@ class KlineWindow:
 - 周期切换：日K（120根）、周K（400根，日线聚合）、月K（800根，日线聚合）
 - 由 `_schedule_refresh` 的 `after()` 回调驱动定时刷新（若启用）
 
+### 5b. 用 HQChart 渲染 K线（独立进程 + JSON 行协议）
+
+HQChart 是纯 JavaScript 库，没有 Python 版本，要用它就必须嵌一个浏览器内核。
+两个硬约束决定了实现方式：
+
+| 约束 | 后果 |
+|------|------|
+| `webview.start()` 与 tkinter `mainloop()` 都要占主线程 | 必须**分进程**，不能同进程混用 |
+| WebView2 窗口外观像浏览器（F12/检查） | 与"摸鱼/隐蔽"定位有冲突，需知情接受 |
+
+**架构**（本项目已实现，`hqchart_bridge.py` + `hqchart_chart.py`）：
+
+```
+tkinter 主进程                     子进程 (python -m stock_monitor.hqchart_chart)
+┌────────────────────────┐   JSON/stdin   ┌────────────────────────────┐
+│ HqChartKlineWindow     │ ─────────────→ │ ChartApp (pywebview)       │
+│  · 拉数据、推 payload   │                │  · index.html + chart_bridge.js
+│  · 收周期/刷新/关闭事件 │ ←───────────── │  · JsApi 实例收 JS 事件
+└────────────────────────┘   JSON/stdout  └────────────────────────────┘
+```
+
+**实现要点**：
+- 协议用 **JSON 行**（`\n` 分隔），走 `stdin.buffer` / `stdout.buffer` 显式 UTF-8，
+  避免受控制台 cp936 编码影响（`print()` 会乱码，管道不经过它）
+- 图表就绪握手：JS 初始化后上报 `chart_ready`，Python 在此之前**缓冲**数据载荷，
+  就绪后再冲刷 —— 否则 `evaluate_js` 推给一个还没定义的函数，数据会丢
+- 数据获取**仍留在父进程**（`query_kline_data` 不变），子进程只负责渲染，
+  这样聚合逻辑的单测完全不受影响
+- 所有与 HQChart 版本相关的调用收拢到**一个 JS 文件**（`assets/hqchart/chart_bridge.js`）：
+  代码格式（`.SH`/`.SZ` 市场后缀）、配置键名、数据注入（`NetworkFilter` 回调）、
+  指标声明（`Windows`）、实例化入口，都在那里改，Python 不动
+- 双保险可用性检测：`is_available()` 不满足时回退到 matplotlib 版 `KlineWindow`，
+  子进程异常退出时弹窗并回退 —— 任何前置条件不满足都不能让程序崩溃
+- pywebview 版本也要探：`is_available()` 里用 `inspect.signature(create_window)` 检查
+  `js_api` 参数是否存在，版本不匹配时直接回退，而不是拉起一个注定崩掉的子进程
+- 就绪握手要扛住桥接注入的竞态：pywebview 在页面加载完成后才注入 `window.pywebview.api`，
+  JS 侧对"桥接还没好"的 `notify()` 必须入队补发，否则第一个 `chart_ready` 会丢
+- 官方文件的处理：对接**开源版**（Apache 2.0，github.com/jones2000/HQChart，
+  无需授权），`umychart.js` 等放进**子目录** `assets/hqchart/hqchart/`
+  并加入 .gitignore（约 5MB，不入库）；项目自有样式命名为 `app.css`，
+  与官方文件分目录存放
+
+**常见坑点补充**：
+
+| 坑 | 原因 | 修复 |
+|-----|------|------|
+| 子进程启动即 AttributeError | pywebview **5.x 移除了 `@webview.expose`**，装饰器在类定义时就崩 | 5.x 用 `create_window(js_api=实例)`，实例的所有公开方法自动暴露；JS 侧调用方式不变 |
+| 窗口弹出瞬间又消失 | `window.alive()` / `set_topmost()` 在 5.x 也被移除 | 用实例布尔标志自己追踪关闭状态；置顶用 `window.on_top = True` 属性 |
+| 图表一直等就绪超时 | pywebview 在**页面加载完成后**才注入 `window.pywebview.api`，而 `DOMContentLoaded` 时 `notify()` 已经跑过一遍，事件被静默丢弃 | JS 侧把桥接未就绪的事件入队，200ms 轮询补发，加超时上限 |
+| `OSError: [Errno 22] Invalid argument` | 子进程退出后父进程不关管道，解释器退出时去关已经失效的描述符 | 子进程退出时显式 close stdin/stdout/stderr 临时文件；主程序退出时先 terminate 子进程再收尾 |
+| 退出回调里直接调 messagebox 崩溃 | tkinter 不是线程安全的，退出回调在读取线程里 | 统一走 `self._root.after(0, handler)` 调度到主线程 |
+| 子窗口变孤儿进程 | 父进程被杀时子进程 stdin 收到 EOF 但窗口还开着 | 读取循环结束（EOF）时主动 `destroy()` 窗口 |
+| `winfo_destroyed()` 不存在 | 该 API 要 Tk 9.0，国内常见构建仍是 Tk 8.6 | 用 `winfo_exists() == 1` 判断，包一层 try/except |
+| docstring 结尾语法错误 | `"""...区分"用户关窗"和"异常崩溃""""` 四个引号连写 | 结尾短语避开引号，或改成 `... """` |
+
 ### 6. 多股票监控列表架构
 
 监控列表是一个完整的子模块，涉及 4 层交互：

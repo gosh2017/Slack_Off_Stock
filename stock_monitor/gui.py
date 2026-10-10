@@ -18,6 +18,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from stock_monitor.stock_api import query_stock, query_kline_data
 from stock_monitor.stock_search import search_stocks
+from stock_monitor.hqchart_bridge import (
+    HqChartKlineWindow,
+    is_available as hqchart_available,
+)
 from stock_monitor.history_manager import save_query, load_history, clear_history, remove_history_record
 from stock_monitor.watchlist_manager import (
     load_watchlist, add_to_watchlist,
@@ -306,6 +310,30 @@ class KlineWindow:
             btn.config(state=state)
         self.refresh_btn.config(state=state)
 
+    # ── 窗口状态（与 HqChartKlineWindow 对齐的接口） ──
+
+    def alive(self) -> bool:
+        """窗口是否仍然打开"""
+        if self.win is None:
+            return False
+        try:
+            # 用 winfo_exists() 而不是 winfo_destroyed()：后者依赖 Tk 9.0，
+            # 在 Tk 8.6 的构建里没有这个方法（实测 Python 3.14 + Tk 8.6 缺失）
+            return self.win.winfo_exists() == 1
+        except (tk.TclError, AttributeError):
+            return False
+
+    def activate(self):
+        """把窗口提到前台"""
+        if self.alive():
+            self.win.lift()
+            self.win.focus_force()
+
+    def close(self):
+        """关闭窗口"""
+        if self.alive():
+            self.win.destroy()
+
 
 
 class StockMonitorApp:
@@ -316,6 +344,8 @@ class StockMonitorApp:
         self.root.title("行情")
         self.root.geometry("480x420")
         self.root.resizable(True, True)
+        # 主窗口关闭时一并收尾 K线窗口，避免留下孤儿子进程
+        self.root.protocol("WM_DELETE_WINDOW", self._on_root_close)
         self.root.minsize(400, 380)
         self.root.configure(bg=COLOR_BG)
 
@@ -1157,6 +1187,23 @@ class StockMonitorApp:
 
     # ──────────────── K线窗口 ────────────────
 
+    def _on_root_close(self):
+        """关闭主窗口：先收尾所有 K线窗口，再退出事件循环
+
+        HQChart 后端是独立子进程，不主动结束会在退出时留下孤儿进程和
+        管道关闭噪声；matplotlib 版是 Toplevel，随手关掉即可。
+        """
+        for kw in list(getattr(self, "_kline_windows", {}).values()):
+            try:
+                if hasattr(kw, "terminate"):
+                    kw.terminate()
+                else:
+                    kw.close()
+            except Exception:
+                pass
+        self._kline_windows.clear()
+        self.root.destroy()
+
     def _on_open_kline(self):
         """打开当前查询股票的 K线窗口"""
         if not self.current_code:
@@ -1179,17 +1226,50 @@ class StockMonitorApp:
         self._open_kline_window(code, stock_type, name)
 
     def _open_kline_window(self, code, stock_type, name=""):
-        """创建/打开指定股票的 K线窗口（单例：同类只开一个）"""
-        # 若已有，则聚焦
-        if hasattr(self, "_kline_windows"):
-            key = (code, stock_type)
-            if key in self._kline_windows and not self._kline_windows[key].win.winfo_destroyed():
-                self._kline_windows[key].win.lift()
-                return
-        else:
+        """创建/打开指定股票的 K线窗口（单例：同类只开一个）
+
+        优先使用 HQChart 后端（hqchart_bridge），不满足条件时回退到
+        matplotlib 版本（KlineWindow）。两种后端的接口一致：
+        alive() / activate() / close()
+        """
+        if not hasattr(self, "_kline_windows"):
             self._kline_windows = {}
-        kw = KlineWindow(code, stock_type, name)
-        self._kline_windows[(code, stock_type)] = kw
+        key = (code, stock_type)
+
+        # 若已有活着的窗口，聚焦后返回；顺带清掉已关闭的残留记录
+        existing = self._kline_windows.get(key)
+        if existing is not None:
+            if existing.alive():
+                existing.activate()
+                return
+            self._kline_windows.pop(key, None)
+
+        if not hqchart_available():
+            self._kline_windows[key] = KlineWindow(code, stock_type, name)
+            return
+
+        try:
+            kw = HqChartKlineWindow(self.root, code, stock_type, name)
+        except Exception as e:
+            messagebox.showwarning(
+                "K线窗口",
+                "HQChart 启动失败：%s\n\n改用 matplotlib 显示" % e,
+                parent=self.root,
+            )
+            self._kline_windows[key] = KlineWindow(code, stock_type, name)
+            return
+
+        kw.on_crash = lambda msg: self._on_kline_backend_crash(
+            code, stock_type, name, msg)
+        kw.on_closed = lambda: self._kline_windows.pop(key, None)
+        self._kline_windows[key] = kw
+
+    def _on_kline_backend_crash(self, code, stock_type, name, message):
+        """HQChart 子进程异常退出：提示后回退到 matplotlib 窗口"""
+        key = (code, stock_type)
+        self._kline_windows.pop(key, None)
+        messagebox.showerror("K线窗口", message, parent=self.root)
+        self._kline_windows[key] = KlineWindow(code, stock_type, name)
 
     # ──────────────── 后台线程 ────────────────
 

@@ -1,0 +1,30 @@
+HQChart 开源版 —— 版权与授权说明
+=================================
+
+本目录下的三个 JavaScript 文件来自开源项目 HQChart：
+
+    原始仓库    https://github.com/jones2000/HQChart
+    作者        jones <jones_2000@163.com>
+    版权        Copyright (c) 2018 jones
+
+    umychart.js               封装行情类图形控件 (H5版本)
+    umychart.complier.js      分析家语法编译执行器 (H5版本)
+    umychart.index.data.js    系统指标 (H5版本)
+
+授权协议：Apache License 2.0
+许可证正文：项目根目录的 LICENSE（http://www.apache.org/licenses/LICENSE-2.0）
+组件授权声明：项目根目录的 NOTICE
+
+---------------------------------------------------------------------------
+
+本项目的用法与修改情况：
+
+  · 三个 JS 文件均为原样复制，**未做任何修改**。
+  · 文件头部自带的版权声明必须保留，不要删除。
+  · 本项目与 HQChart 之间的全部适配逻辑都在上层的 `chart_bridge.js`，
+    没有改动 `hqchart/` 里的任何一行。
+
+对外发布时的要求：
+
+  Apache 2.0 第 4(a)(d) 条要求在分发时随附 LICENSE 和 NOTICE，
+  根目录的两个文件已经就位，打包发布时一并带上即可（见 build_exe.py）。

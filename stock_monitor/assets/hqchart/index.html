@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K线</title>
+<!-- 本项目自有样式；HQChart 自带的样式（hqchart/style.css）可选引入 -->
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+    <!-- 顶部工具栏：周期切换 / 刷新，样式与 tkinter 主窗口保持一致 -->
+    <div id="toolbar">
+        <span id="title">--</span>
+        <span id="status"></span>
+        <span class="spacer"></span>
+        <button class="tb-btn active" data-period="daily" id="btn-daily">日K</button>
+        <button class="tb-btn" data-period="weekly" id="btn-weekly">周K</button>
+        <button class="tb-btn" data-period="monthly" id="btn-monthly">月K</button>
+        <button class="tb-btn" id="btn-refresh">刷新</button>
+    </div>
+
+    <!-- HQChart 图表容器 -->
+    <div id="mainChart"></div>
+
+    <!-- 兜底提示（HQChart 缺失或加载失败时由 chart_bridge.js 显示） -->
+    <div id="notice" style="display:none"></div>
+
+    <!-- HQChart 开源库（Apache 2.0，已随仓库分发，见本目录的 README.md）
+         顺序不能换：umychart.js 运行时用到后两个文件定义的指标库与编译器 -->
+    <script src="./hqchart/umychart.js"></script>
+    <script src="./hqchart/umychart.complier.js"></script>
+    <script src="./hqchart/umychart.index.data.js"></script>
+    <!-- 本项目与 HQChart 之间的适配层 -->
+    <script src="./chart_bridge.js"></script>
+</body>
+</html>
