@@ -374,6 +374,9 @@ class StockMonitorApp:
 
         # K线图嵌入相关（已移至独立 KlineWindow，不再使用）
 
+        # 已打开的 K线窗口：key=(code, stock_type) -> 窗口对象
+        self._kline_windows = {}
+
         # 监控列表相关
         self.watchlist = []         # 当前监控列表 [{code, type, name, price}]
         self._watchlist_pending = 0 # 本轮未完成的查询线程数（用于复位状态栏）
@@ -1193,7 +1196,7 @@ class StockMonitorApp:
         HQChart 后端是独立子进程，不主动结束会在退出时留下孤儿进程和
         管道关闭噪声；matplotlib 版是 Toplevel，随手关掉即可。
         """
-        for kw in list(getattr(self, "_kline_windows", {}).values()):
+        for kw in list(self._kline_windows.values()):
             try:
                 if hasattr(kw, "terminate"):
                     kw.terminate()
@@ -1232,8 +1235,6 @@ class StockMonitorApp:
         matplotlib 版本（KlineWindow）。两种后端的接口一致：
         alive() / activate() / close()
         """
-        if not hasattr(self, "_kline_windows"):
-            self._kline_windows = {}
         key = (code, stock_type)
 
         # 若已有活着的窗口，聚焦后返回；顺带清掉已关闭的残留记录
