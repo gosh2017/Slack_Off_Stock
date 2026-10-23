@@ -119,13 +119,12 @@ def test_session_never_starts_below_one():
     assert ReplaySession(total=10, start_count=0).count == 1
 
 
-def test_session_empty_data_is_done_but_not_finished():
+def test_session_empty_data_is_not_finished():
     s = ReplaySession(total=0)
 
     assert s.count == 0
     assert s.total == 0
     assert s.finished is False
-    assert s.done == 0.0
 
 
 def test_session_step_never_below_one():
@@ -155,35 +154,13 @@ def test_session_advance_with_bigger_step_overshoots_to_total():
     assert s.finished is True
 
 
-def test_session_index_tracks_last_bar():
-    s = ReplaySession(total=8, start_count=3)
-
-    assert s.index == 2          # 第 3 根，下标 2
-    s.advance()
-    assert s.index == 3
-
-
-def test_session_done_reports_fraction():
-    s = ReplaySession(total=4, start_count=2)
-
-    assert s.done == 0.5
-    s.advance()
-    assert s.done == 0.75
-
-
-def test_session_slice_and_date_at():
+def test_session_date_at_tracks_the_revealed_last_bar():
     data = _klines(6)
     s = ReplaySession(total=6, start_count=2)
 
-    assert s.slice(data) == data[:2]
     assert s.date_at(data) == "2024-01-01"
-
     s.count = 5
-    assert s.slice(data) == data[:5]
-
-
-def test_session_slice_tolerates_empty_input():
-    assert ReplaySession(total=0).slice([]) == []
+    assert s.date_at(data) == "2024-01-01"
 
 
 def test_session_date_at_empty_or_dirty_input():

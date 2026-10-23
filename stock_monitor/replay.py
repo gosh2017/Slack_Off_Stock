@@ -45,8 +45,6 @@ STATE_RUNNING = "running"  # 播放中
 STATE_PAUSED = "paused"    # 已暂停
 STATE_FINISHED = "finished"  # 已播到最新
 
-IDLE = STATE_IDLE
-
 
 def clamp_interval(ms) -> int:
     """把速度参数收敛到合法区间，非法输入回落到默认值。"""
@@ -89,28 +87,12 @@ class ReplaySession:
         """是否已经播到最新一根"""
         return self.total > 0 and self.count >= self.total
 
-    @property
-    def index(self) -> int:
-        """当前最后一根 bar 的下标（未开始时为 -1）"""
-        return self.count - 1
-
-    @property
-    def done(self) -> bool:
-        """已揭示 / 总数"""
-        if not self.total:
-            return 0.0
-        return min(1.0, self.count / self.total)
-
     def advance(self) -> int:
         """推进一步，返回推进后的已揭示 bar 数（不会超过 total）。"""
         if self.finished:
             return self.count
         self.count = min(self.total, self.count + self.step)
         return self.count
-
-    def slice(self, klines: list) -> list:
-        """当前进度对应的 K 线切片"""
-        return (klines or [])[:self.count]
 
     def date_at(self, klines: list) -> str:
         """当前最后一根 bar 的日期（用于状态栏显示），取不到返回空串"""

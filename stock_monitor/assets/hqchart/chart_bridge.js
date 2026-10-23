@@ -176,15 +176,6 @@
     }
 
     /**
-     * 判断当前状态下「回放」按钮该不该可点。
-     * idle 能开始；finished 也能再点一次重播（不必先回"最新"）；
-     * running / paused 期间点了没意义。
-     */
-    function canStartReplay(state) {
-        return state === "idle" || state === "finished";
-    }
-
-    /**
      * 同步回放三个按钮的可点状态和文案。
      * 暂停/继续共用一个按钮；"最新"在回放中才能点。
      */
@@ -194,8 +185,8 @@
         var latest = document.getElementById("btn-latest");
 
         if (replay) {
-            // 播完后也能再点一次重播，不必先回"最新"
-            replay.disabled = !canStartReplay(state);
+            // idle 能开始；finished 也能再点一次重播，不必先回"最新"
+            replay.disabled = !(state === "idle" || state === "finished");
         }
         if (pause) {
             pause.disabled = (state !== "running" && state !== "paused");

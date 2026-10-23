@@ -273,7 +273,9 @@ def query_kline_data(stock_code: str, stock_type: str = "stock",
         count:      返回的数据条数（默认 120）。
                     请求时会按 max(该周期默认条数, count) 拉取日线，
                     最后只返回最近的 count 根，所以回放这类需要更长历史
-                    的场景可以直接传更大的 count
+                    的场景可以直接传更大的 count。
+                    count<=0 / 非法值会被当 0 处理（不裁剪，返回拉到的全部），
+                    过大的值也会被压到 _KLINE_FETCH_CAP
 
     返回：
         {

@@ -673,11 +673,11 @@ def test_replay_pause_freezes_and_stop_restores_full_data():
 
     bridge.stop_replay()
     stopped = _drain_messages(bridge)
-    # 只发一份完整数据（不带 replay 标记 = 退出回放模式）；
-    # 状态已经 idle、session 已清空，没有可同步的状态了
-    assert [m["cmd"] for m in stopped] == ["data"]
-    assert "replay" not in stopped[0]["payload"]
-    assert len(stopped[0]["payload"]["items"]) == 10
+    # 一条"空闲"复位状态栏，再一份完整数据重画（不带 replay 标记 = 退出回放）
+    assert [m["cmd"] for m in stopped] == ["replay_state", "data"]
+    assert stopped[0]["state"] == "idle"
+    assert "replay" not in stopped[1]["payload"]
+    assert len(stopped[1]["payload"]["items"]) == 10
     assert bridge.replay.session is None
     assert bridge.replay.state == "idle"
 
@@ -691,6 +691,24 @@ def test_replay_start_without_data_triggers_a_fetch():
 
     assert bridge._replay_wanted is True
     assert fetched == [hqchart_bridge.replay_count("daily")]
+    assert bridge.replay.session is None
+
+
+def test_replay_start_while_a_fetch_is_in_flight_waits():
+    """上一次请求还没回来时点"回放"要先等一下。
+
+    否则它记着"想回放"，等那批普通的 120 根一回来就会用 120 根开播，
+    而不是回放该有的 500 根。
+    """
+    bridge, root = _replay_bridge(10)
+    fetched = []
+    bridge.fetch = lambda period=None, count=None: fetched.append(count)
+    bridge._loading = True
+
+    bridge.start_replay(700)
+
+    assert fetched == []
+    assert bridge._replay_wanted is False
     assert bridge.replay.session is None
 
 
@@ -754,6 +772,7 @@ def test_fetch_stops_an_active_replay(monkeypatch):
     monkeypatch.setattr(
         hqchart_bridge.threading, "Thread", lambda **kwargs: fake_thread)
 
+    _drain_messages(bridge)                      # 清空开播时的消息
     bridge.fetch(period="weekly", count=1500)
 
     assert bridge.replay.active is False
@@ -761,8 +780,19 @@ def test_fetch_stops_an_active_replay(monkeypatch):
     assert bridge.replay.session is None
     assert bridge.period == "weekly"
     assert bridge._loading is True
-    _drain_messages(bridge)                      # 清空，便于下面的断言
-    assert _drain_messages(bridge) == []         # 退出回放时不额外画图
+    # 停掉回放就要发一条"空闲"让页面复位（全量数据还没到手，没有载荷可用）：
+    # 否则按钮还停在"暂停"，而 Python 这边已经空闲了
+    msgs = _drain_messages(bridge)
+    assert [m["cmd"] for m in msgs] == ["replay_state"]
+    assert msgs[0]["state"] == "idle"
+
+    # 新请求又失败了：只该带错误信息，不能把页面状态弄乱
+    bridge._on_data_ready({"error": "网络连接失败，请检查网络", "klines": []})
+    msgs = _drain_messages(bridge)
+    assert [m["cmd"] for m in msgs] == ["data"]
+    assert msgs[0]["payload"]["error"] == "网络连接失败，请检查网络"
+    assert bridge._replay_wanted is False
+    assert bridge.replay.active is False
 
 
 def test_set_replay_interval_clamps_and_applies():
@@ -786,7 +816,8 @@ def test_shutdown_replay_stops_the_timer_without_rendering():
 
     assert root.scheduled == []
     assert bridge.replay.session is None
-    assert _drain_messages(bridge) == []        # 不会画任何图
+    # 只会带一条"空闲"状态，不会重画任何图
+    assert [m["cmd"] for m in _drain_messages(bridge)] == ["replay_state"]
 
 
 def test_shutdown_replay_is_safe_without_replay_attribute():

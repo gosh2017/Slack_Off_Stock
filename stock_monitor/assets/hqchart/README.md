@@ -135,6 +135,9 @@ K 线窗口放在**独立进程**是因为 pywebview 的 `webview.start()` 和 t
 - 载荷：回放帧的 `data` 载荷带 `replay: true`，另有 `replayCount` / `replayTotal`
   / `replayDate` / `replayState` 供状态栏显示
 - `replay_state` 消息：只同步按钮和状态栏，不重画图表（暂停瞬间不该闪一下）
+  回放被停掉时（换周期、刷新、点"最新"）也会来一条，此时
+  `state: "idle"` 且 `count` / `total` 都是 0 —— 页面靠它把按钮复位，
+  否则按钮会停在停掉之前的样子（还亮着"暂停"）
 - 页面 → 主进程的事件：`replay_start`（带 `interval`）、`replay_pause`、
   `replay_resume`、`replay_stop`、`replay_speed`
 

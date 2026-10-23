@@ -41,7 +41,7 @@ from stock_monitor.stock_api import query_kline_data
 from stock_monitor.replay import (
     ReplaySession, ReplayDriver,
     replay_count, clamp_interval,
-    DEFAULT_INTERVAL, STATE_IDLE,
+    DEFAULT_INTERVAL,
 )
 
 # ──────────────── 可选依赖：pywebview ────────────────
@@ -506,6 +506,11 @@ class HqChartKlineWindow:
         平时看盘只要最近 120 根，回放要从最左边播起来，所以先多要一批历史
         再开播。已经拿到数据（klines 不为空）时直接开播，省掉一次网络往返。
         """
+        # 请求还在飞的时候点了"回放"就先放着：否则它记着"想回放"，
+        # 等这批普通请求回来时会用普通的 120 根开播，而不是回放该有的 500 根。
+        # 和 matplotlib 那版（gui.KlineWindow.start_replay）保持一致。
+        if self._loading:
+            return
         self._replay_interval = clamp_interval(interval)
         if klines is None:
             self._replay_wanted = True
@@ -576,7 +581,15 @@ class HqChartKlineWindow:
 
     def _on_replay_state(self, state: str, session):
         """回放状态变了（暂停/继续/结束）：只同步状态，不重画图表"""
-        if session is None or not self._last_klines:
+        if not self._last_klines:
+            return
+        if session is None:
+            # 回放被停掉时没有进度可报，但页面还不知道：停掉之前它还显示
+            # "暂停"，而 Python 这边已经空闲了。发一条空进度让它复位。
+            # matplotlib 那版的回调（KlineWindow._update_replay_ui）本来就按
+            # session 为空处理，这里对齐。
+            self._send({"cmd": "replay_state", "state": state,
+                        "count": 0, "total": 0, "date": ""})
             return
         klines = self._last_klines
         count = max(1, min(session.count, len(klines)))
