@@ -560,3 +560,305 @@ def test_send_writes_encoded_line(monkeypatch):
     bridge._send({"cmd": "focus"})
 
     assert written.getvalue() == hqchart_bridge.encode_line({"cmd": "focus"})
+
+
+# ──────────────── 历史回放 ────────────────
+
+class NoopRoot:
+    """假 tkinter 窗口：记录 after() 但不自动执行，测试里手动放行。"""
+
+    def __init__(self):
+        self.scheduled = []
+        self._next_id = 0
+
+    def after(self, delay, fn, *args):
+        self._next_id += 1
+        self.scheduled.append((self._next_id, delay, fn, args))
+        return self._next_id
+
+    def after_cancel(self, after_id):
+        self.scheduled = [it for it in self.scheduled if it[0] != after_id]
+
+    def fire_next(self):
+        item = self.scheduled.pop(0)
+        item[2](*item[3])
+        return item
+
+
+def _replay_klines(n=10, base="2024-01-01"):
+    """造 n 根假 K 线"""
+    return [{"date": base, "open": 10.0, "close": 10.5, "high": 11.0,
+             "low": 9.8, "volume": 100} for _ in range(n)]
+
+
+def _replay_bridge(n=10):
+    """在 _bare_bridge 上补上回放相关的状态，返回 (bridge, root)"""
+    bridge = _bare_bridge()
+    root = NoopRoot()
+    bridge._root = root
+    bridge._last_klines = _replay_klines(n)
+    bridge._replay_wanted = False
+    bridge._replay_interval = hqchart_bridge.DEFAULT_INTERVAL
+    bridge.replay = hqchart_bridge.ReplayDriver(
+        root, bridge._render_replay, on_state=bridge._on_replay_state)
+    bridge.proc = FakeProc()
+    return bridge, root
+
+
+def _drain_messages(bridge):
+    """取出并清空子进程收到的所有消息"""
+    text = bridge.proc.stdin.getvalue().decode("utf-8")
+    msgs = [hqchart_bridge.decode_line(line)
+            for line in text.splitlines() if line.strip()]
+    bridge.proc.stdin.seek(0)
+    bridge.proc.stdin.truncate()
+    return msgs
+
+
+def test_replay_start_sends_reveal_frame_and_state():
+    bridge, root = _replay_bridge(10)
+
+    bridge.start_replay(400, _replay_klines(10))
+
+    msgs = _drain_messages(bridge)
+    # 先一条纯状态消息（不重画），再一条带进度的数据帧
+    assert [m["cmd"] for m in msgs] == ["replay_state", "data"]
+
+    frame = msgs[1]["payload"]
+    assert frame["replay"] is True
+    assert frame["replayCount"] == 5            # 默认第一帧 5 根
+    assert frame["replayTotal"] == 10
+    assert frame["replayState"] == "running"
+    assert len(frame["items"]) == 5
+    assert bridge.replay.running is True
+    assert root.scheduled and root.scheduled[0][1] == 400
+
+
+def test_replay_tick_advances_the_revealed_count():
+    bridge, root = _replay_bridge(10)
+
+    bridge.start_replay(400, _replay_klines(10))
+    _drain_messages(bridge)
+
+    root.fire_next()
+
+    msgs = _drain_messages(bridge)
+    assert len(msgs) == 1
+    assert msgs[0]["payload"]["replayCount"] == 6
+
+
+def test_replay_reaches_total_and_finishes():
+    bridge, root = _replay_bridge(6)
+
+    bridge.start_replay(100, _replay_klines(6))
+    _drain_messages(bridge)
+    root.fire_next()                            # 5 → 6，播完
+
+    assert bridge.replay.state == "finished"
+    assert bridge.replay.session.finished is True
+    assert root.scheduled == []                 # 播完不再排下一次
+
+
+def test_replay_pause_freezes_and_stop_restores_full_data():
+    bridge, root = _replay_bridge(10)
+
+    bridge.start_replay(400, _replay_klines(10))
+    _drain_messages(bridge)
+
+    bridge.pause_replay()
+    paused = _drain_messages(bridge)
+    assert paused[0]["cmd"] == "replay_state"
+    assert paused[0]["state"] == "paused"
+    assert root.scheduled == []
+
+    bridge.stop_replay()
+    stopped = _drain_messages(bridge)
+    # 只发一份完整数据（不带 replay 标记 = 退出回放模式）；
+    # 状态已经 idle、session 已清空，没有可同步的状态了
+    assert [m["cmd"] for m in stopped] == ["data"]
+    assert "replay" not in stopped[0]["payload"]
+    assert len(stopped[0]["payload"]["items"]) == 10
+    assert bridge.replay.session is None
+    assert bridge.replay.state == "idle"
+
+
+def test_replay_start_without_data_triggers_a_fetch():
+    bridge, root = _replay_bridge(10)
+    fetched = []
+    bridge.fetch = lambda period=None, count=None: fetched.append(count)
+
+    bridge.start_replay(700)
+
+    assert bridge._replay_wanted is True
+    assert fetched == [hqchart_bridge.replay_count("daily")]
+    assert bridge.replay.session is None
+
+
+def test_replay_fetch_result_starts_the_replay(monkeypatch):
+    bridge, root = _replay_bridge(10)
+    bridge._replay_wanted = True
+    bridge._replay_interval = 300
+
+    bridge._on_data_ready({"error": None, "klines": _replay_klines(12)})
+
+    msgs = _drain_messages(bridge)
+    assert [m["cmd"] for m in msgs] == ["replay_state", "data"]
+    # 关键：回放开播时不能先推一份全量数据，否则第一帧会闪一下"全部可见"
+    assert msgs[1]["payload"]["replay"] is True
+    assert len(msgs[1]["payload"]["items"]) == 5
+    assert msgs[1]["payload"]["replayTotal"] == 12
+    assert bridge._replay_wanted is False
+
+
+def test_normal_fetch_still_sends_full_payload(monkeypatch):
+    bridge, root = _replay_bridge(10)
+
+    bridge._on_data_ready({"error": None, "klines": _replay_klines(7)})
+
+    msgs = _drain_messages(bridge)
+    assert len(msgs) == 1
+    assert msgs[0]["cmd"] == "data"
+    assert "replay" not in msgs[0]["payload"]
+    assert len(msgs[0]["payload"]["items"]) == 7
+    assert bridge._last_klines == _replay_klines(7)
+
+
+def test_replay_fetch_error_resets_the_wanted_flag():
+    bridge, root = _replay_bridge(10)
+    bridge._replay_wanted = True
+
+    bridge._on_data_ready({"error": "网络连接失败，请检查网络", "klines": []})
+
+    msgs = _drain_messages(bridge)
+    assert msgs[0]["payload"]["error"] == "网络连接失败，请检查网络"
+    assert bridge._replay_wanted is False
+
+
+def test_begin_replay_refuses_too_little_data():
+    bridge, root = _replay_bridge(10)
+
+    bridge._begin_replay(_replay_klines(2))
+
+    msgs = _drain_messages(bridge)
+    assert msgs[0]["payload"]["error"] == "数据不足，无法回放"
+    assert bridge.replay.session is None
+
+
+def test_fetch_stops_an_active_replay(monkeypatch):
+    bridge, root = _replay_bridge(10)
+    bridge.start_replay(400, _replay_klines(10))
+    assert bridge.replay.active is True
+
+    # 挡掉后台线程，只验证主线程上的状态变化
+    fake_thread = SimpleNamespace(start=lambda: None)
+    monkeypatch.setattr(
+        hqchart_bridge.threading, "Thread", lambda **kwargs: fake_thread)
+
+    bridge.fetch(period="weekly", count=1500)
+
+    assert bridge.replay.active is False
+    assert bridge.replay.state == "idle"
+    assert bridge.replay.session is None
+    assert bridge.period == "weekly"
+    assert bridge._loading is True
+    _drain_messages(bridge)                      # 清空，便于下面的断言
+    assert _drain_messages(bridge) == []         # 退出回放时不额外画图
+
+
+def test_set_replay_interval_clamps_and_applies():
+    bridge, root = _replay_bridge(10)
+
+    bridge.set_replay_interval(1234)
+    assert bridge._replay_interval == 1234
+    assert bridge.replay.interval == 1234
+
+    bridge.set_replay_interval("垃圾值")
+    assert bridge._replay_interval == hqchart_bridge.DEFAULT_INTERVAL
+
+
+def test_shutdown_replay_stops_the_timer_without_rendering():
+    bridge, root = _replay_bridge(10)
+    bridge.start_replay(400, _replay_klines(10))
+    assert root.scheduled
+    _drain_messages(bridge)
+
+    bridge._shutdown_replay()
+
+    assert root.scheduled == []
+    assert bridge.replay.session is None
+    assert _drain_messages(bridge) == []        # 不会画任何图
+
+
+def test_shutdown_replay_is_safe_without_replay_attribute():
+    bridge = _bare_bridge()                      # 没有 replay 属性
+    bridge._shutdown_replay()                    # 不应抛异常
+
+
+# ──────────────── 回放事件的进程间分发 ────────────────
+
+class _RecordingBridge:
+    """只记录被调用的桥接替身"""
+
+    def __init__(self, root=None):
+        self._root = root or FakeRoot()
+        self.calls = []
+
+    def start_replay(self, interval=None, klines=None):
+        self.calls.append(("start", interval, klines))
+
+    def pause_replay(self):
+        self.calls.append(("pause",))
+
+    def resume_replay(self):
+        self.calls.append(("resume",))
+
+    def stop_replay(self, render_all=True):
+        self.calls.append(("stop", render_all))
+
+    def set_replay_interval(self, ms):
+        self.calls.append(("speed", ms))
+
+
+def _bridge_for_dispatch(root):
+    """给 _dispatch 用的最小替身：只关心事件被路由到了哪个方法"""
+    bridge = hqchart_bridge.HqChartKlineWindow.__new__(
+        hqchart_bridge.HqChartKlineWindow)
+    bridge._root = root
+    return bridge
+
+
+def test_dispatch_routes_replay_events():
+    root = FakeRoot()
+    bridge = _bridge_for_dispatch(root)
+    recorder = _RecordingBridge()
+    for name in ("start_replay", "pause_replay", "resume_replay",
+                 "stop_replay", "set_replay_interval"):
+        setattr(bridge, name, getattr(recorder, name))
+
+    bridge._dispatch({"event": "replay_start", "interval": 300})
+    bridge._dispatch({"event": "replay_pause"})
+    bridge._dispatch({"event": "replay_resume"})
+    bridge._dispatch({"event": "replay_stop"})
+    bridge._dispatch({"event": "replay_speed", "interval": 800})
+
+    assert recorder.calls == [
+        ("start", 300, None),
+        ("pause",),
+        ("resume",),
+        ("stop", True),
+        ("speed", 800),
+    ]
+    # 事件回调都调度到了主线程（delay=0）
+    assert root.calls and all(c[0] == 0 for c in root.calls)
+
+
+def test_dispatch_missing_replay_interval_defaults():
+    root = FakeRoot()
+    bridge = _bridge_for_dispatch(root)
+    recorder = _RecordingBridge()
+    bridge.start_replay = recorder.start_replay
+
+    bridge._dispatch({"event": "replay_start"})
+
+    assert recorder.calls == [("start", None, None)]
+

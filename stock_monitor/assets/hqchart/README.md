@@ -126,3 +126,19 @@ tkinter 主进程                            子进程（hqchart_chart.py）
 
 K 线窗口放在**独立进程**是因为 pywebview 的 `webview.start()` 和 tkinter 的
 `mainloop()` 都要占用主线程，无法共存于同一进程。
+
+## 历史回放
+
+回放的**定拍在主进程**（`stock_monitor/replay.py` 的 `ReplayDriver`，用
+`root.after()` 定时），子进程只负责照着画，所以暂停 / 继续都不需要重新拉数据。
+
+- 载荷：回放帧的 `data` 载荷带 `replay: true`，另有 `replayCount` / `replayTotal`
+  / `replayDate` / `replayState` 供状态栏显示
+- `replay_state` 消息：只同步按钮和状态栏，不重画图表（暂停瞬间不该闪一下）
+- 页面 → 主进程的事件：`replay_start`（带 `interval`）、`replay_pause`、
+  `replay_resume`、`replay_stop`、`replay_speed`
+
+回放每一步都复用同一个图表实例重新 `SetOption`（`renderRows()`），而不是
+`destroyChart()` + `JSChart.Init()` 重建：重建会让几百步回放每次都重建 canvas 和
+事件绑定，既卡又闪。matplotlib 版本走的是 `KlineWindow`，两端的回放操作一致，
+差异只在各自的画图画法。

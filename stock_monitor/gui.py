@@ -22,6 +22,10 @@ from stock_monitor.hqchart_bridge import (
     HqChartKlineWindow,
     is_available as hqchart_available,
 )
+from stock_monitor.replay import (
+    ReplaySession, ReplayDriver, replay_count, clamp_interval,
+    DEFAULT_INTERVAL,
+)
 from stock_monitor.history_manager import save_query, load_history, clear_history, remove_history_record
 from stock_monitor.watchlist_manager import (
     load_watchlist, add_to_watchlist,
@@ -66,7 +70,7 @@ _TYPE_LABEL = {"stock": "股票", "index": "指数", "etf": "ETF"}
 # ──────────────── K线图表独立窗口 ────────────────
 
 class KlineWindow:
-    """独立的 K线图表窗口（Toplevel），支持日K/周K/月K。"""
+    """独立的 K线图表窗口（Toplevel），支持日K/周K/月K 和历史回放。"""
 
     def __init__(self, code: str, stock_type: str, name: str = ""):
         self.code = code
@@ -79,9 +83,16 @@ class KlineWindow:
         # 窗口
         self.win = tk.Toplevel()
         self.win.title(f"K线 — {name or code} ({code})")
-        self.win.geometry("780x560")
-        self.win.minsize(520, 380)
+        self.win.geometry("820x560")
+        self.win.minsize(560, 380)
         self.win.configure(bg=COLOR_BG)
+
+        # 历史回放：完整 K 线一直留在 kline_data 里，回放只是画前 N 根。
+        # 定拍交给 ReplayDriver，和 HQChart 后端共用同一套逻辑
+        self._replay_wanted = False
+        self._replay_interval = DEFAULT_INTERVAL
+        self.replay = ReplayDriver(self.win, self._render_replay,
+                                   on_state=self._update_replay_ui)
 
         # UI
         self._build_toolbar()
@@ -131,17 +142,51 @@ class KlineWindow:
         )
         self.refresh_btn.pack(side=tk.RIGHT, padx=4)
 
+        # ── 历史回放 ──
+        self._replay_speeds = [("慢", 2000), ("中", 1000),
+                               ("快", 400), ("极快", 150)]
+        self.speed_var = tk.StringVar(value="快")
+        self.speed_menu = tk.OptionMenu(
+            toolbar, self.speed_var,
+            *(label for label, _ in self._replay_speeds),
+            font=FONT_BTN, bg="#E0E0E0", fg="#333", width=4,
+        )
+        self.speed_menu.pack(side=tk.RIGHT, padx=4)
+
+        self.replay_btn = tk.Button(
+            toolbar, text="回放", font=("微软雅黑", 8), width=4,
+            bg="#E0E0E0", fg="#333", command=self.start_replay,
+        )
+        self.replay_btn.pack(side=tk.RIGHT, padx=1)
+
+        self.pause_btn = tk.Button(
+            toolbar, text="暂停", font=("微软雅黑", 8), width=4,
+            bg="#E0E0E0", fg="#333", state=tk.DISABLED,
+            command=self._toggle_replay_pause,
+        )
+        self.pause_btn.pack(side=tk.RIGHT, padx=1)
+
+        self.latest_btn = tk.Button(
+            toolbar, text="最新", font=("微软雅黑", 8), width=4,
+            bg="#E0E0E0", fg="#333", state=tk.DISABLED,
+            command=self.stop_replay,
+        )
+        self.latest_btn.pack(side=tk.RIGHT, padx=1)
+
     # ── 数据获取 ──
 
-    def _fetch_kline(self):
+    def _fetch_kline(self, count=None):
         if not MATPLOTLIB_OK or self._loading or not self.code:
             return
+        # 换周期 / 手动刷新都会整图重画，进行中的回放先退出
+        if self.replay.active:
+            self.replay.stop(render_all=False)
         self._loading = True
         self.status_label.config(text="加载中...")
         self._set_btn_state(tk.DISABLED)
 
         count_map = {"daily": 120, "weekly": 400, "monthly": 800}
-        count = count_map.get(self.period, 120)
+        count = count or count_map.get(self.period, 120)
         threading.Thread(
             target=self._fetch_thread,
             args=(count,), daemon=True,
@@ -168,9 +213,18 @@ class KlineWindow:
                     transform=self.kline_ax_price.transAxes,
                     ha="center", va="center", fontsize=9, color="#888")
                 self.kline_canvas.draw()
+            self._replay_wanted = False
+            self._update_replay_ui()
             return
 
         self.kline_data = result["klines"]
+
+        if self._replay_wanted:
+            # 回放：先别画全量，否则第一帧会闪一下"全部可见"
+            self._replay_wanted = False
+            self._begin_replay()
+            return
+
         self.status_label.config(text="")
         self._init_figure()
         self._draw()
@@ -202,8 +256,11 @@ class KlineWindow:
 
     # ── 绘制 ──
 
-    def _draw(self):
+    def _draw(self, limit=None):
+        """画 K 线图。limit 不为空时只画前 limit 根（历史回放用）。"""
         klines = self.kline_data
+        if limit is not None:
+            klines = klines[:max(1, min(int(limit), len(klines)))]
         if len(klines) < 2:
             self.status_label.config(text="数据不足")
             return
@@ -309,6 +366,84 @@ class KlineWindow:
         for btn in self.period_btns.values():
             btn.config(state=state)
         self.refresh_btn.config(state=state)
+        self.speed_menu.config(state=state)
+
+    # ── 历史回放 ──
+    # 界面从最早一根 bar 开始，按固定间隔逐根揭示到最新，可暂停 / 继续。
+    # 完整数据一直在 kline_data 里，回放只是画前 N 根，暂停继续都不用拉数据。
+
+    def start_replay(self):
+        """开始回放：平时只看最近 120 根，回放要多要一批历史才播得起来"""
+        if self._loading:
+            return
+        if self.replay.active:
+            self.replay.stop(render_all=False)
+        self._replay_wanted = True
+        self._replay_interval = clamp_interval(self._replay_speed_ms())
+        self._update_replay_ui()
+        self._fetch_kline(count=replay_count(self.period))
+
+    def _replay_speed_ms(self) -> int:
+        """从速度下拉框读出"每根间隔"的毫秒数"""
+        for label, ms in self._replay_speeds:
+            if label == self.speed_var.get():
+                return ms
+        return DEFAULT_INTERVAL
+
+    def _begin_replay(self):
+        """历史数据到手：建进度并开播"""
+        if len(self.kline_data) < 3:
+            self.status_label.config(text="数据不足，无法回放")
+            self._update_replay_ui()
+            return
+        session = ReplaySession(len(self.kline_data))
+        self.replay.interval = self._replay_interval
+        self.replay.start(session, self._replay_interval)
+
+    def _toggle_replay_pause(self):
+        """暂停 / 继续 共用一个按钮"""
+        if self.replay.running:
+            self.replay.pause()
+        elif self.replay.paused:
+            self.replay.resume()
+
+    def stop_replay(self):
+        """结束回放，回到最新一根"""
+        self.replay.stop(render_all=True)
+
+    def _render_replay(self, count):
+        """回放每推进一步：画前 count 根"""
+        if self.replay.session is None:
+            # stop() 之后画回全量
+            self._draw()
+            return
+        self._draw(self.replay.session.count)
+
+    def _update_replay_ui(self, state=None, session=None):
+        """按回放状态更新工具栏按钮和状态文字"""
+        replay = self.replay
+        starting = self._replay_wanted
+        active = starting or replay.active
+        session = replay.session
+        # 播完也可以再点一次重播，不必先点「最新」
+        restartable = session is not None and session.finished
+
+        self.replay_btn.config(
+            state=tk.NORMAL if (not starting and (not active or restartable))
+                        else tk.DISABLED)
+        self.pause_btn.config(
+            state=tk.NORMAL if (replay.running or replay.paused) else tk.DISABLED)
+        self.pause_btn.config(text="继续" if replay.paused else "暂停")
+        self.latest_btn.config(
+            state=tk.NORMAL if active else tk.DISABLED)
+
+        if replay.session is not None and active:
+            s = replay.session
+            date = s.date_at(self.kline_data)
+            head = "回放完成" if replay.state == "finished" else "回放"
+            self.status_label.config(text=f"{head} {date}  {s.count}/{s.total}")
+        elif not active:
+            self.status_label.config(text="")
 
     # ── 窗口状态（与 HqChartKlineWindow 对齐的接口） ──
 
@@ -331,8 +466,10 @@ class KlineWindow:
 
     def close(self):
         """关闭窗口"""
-        if self.alive():
-            self.win.destroy()
+        if not self.alive():
+            return
+        self.replay.stop(render_all=False)
+        self.win.destroy()
 
 
 

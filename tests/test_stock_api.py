@@ -98,6 +98,17 @@ def _parsed_klines():
     ]
 
 
+def _consecutive_daily_klines(n, start=20240101):
+    """造 n 根连续的假日K线（日期形如 YYYYMMDD，升序，便于校验"取最近 n 根"）。"""
+    from datetime import date, timedelta
+
+    start_day = date(start // 10000, (start // 100) % 100, start % 100)
+    return [_kline_item((start_day + timedelta(days=i)).isoformat(),
+                        10.0 + i * 0.01, 10.1 + i * 0.01,
+                        10.2 + i * 0.01, 9.9 + i * 0.01, 100 + i)
+            for i in range(n)]
+
+
 # ──────────────── _is_etf_code ────────────────
 
 class TestIsEtfCode:
@@ -433,6 +444,64 @@ class TestQueryKlineData:
 
         assert "datalen=120" in get.call_args.args[0]
         assert result["error"] is None
+
+    # ── count 参数（回放要更长的历史，靠它生效） ──
+
+    def test_count_larger_than_default_datalen_uses_count(self):
+        with mock.patch.object(stock_api.requests, "get",
+                               return_value=_FakeResponse(payload=_daily_klines())) as get:
+            stock_api.query_kline_data("600000", count=500)
+
+        assert "datalen=500" in get.call_args.args[0]
+
+    def test_count_smaller_than_default_keeps_period_default(self):
+        # 平时看盘的数据量不能被 count 缩小，否则会越界
+        with mock.patch.object(stock_api.requests, "get",
+                               return_value=_FakeResponse(payload=_daily_klines())) as get:
+            stock_api.query_kline_data("600000", period="weekly", count=50)
+
+        assert "datalen=400" in get.call_args.args[0]
+
+    def test_count_capped_at_fetch_cap(self):
+        with mock.patch.object(stock_api.requests, "get",
+                               return_value=_FakeResponse(payload=_daily_klines())) as get:
+            stock_api.query_kline_data("600000", count=999999)
+
+        assert "datalen=2000" in get.call_args.args[0]
+
+    @pytest.mark.parametrize("count,expected", [
+        (2, 2),          # 保留最近的 2 根
+        (5, 5),          # 中间值
+        (8, 8),          # 正好等于总数
+        (99, 8),         # 比总数多时不裁剪
+        (None, 8),       # 不传 → 用默认 120，不裁剪
+        (0, 8),          # 0 表示"不指定条数"，返回全部
+        (-3, 8),         # 非法值按 0 处理
+        ("abc", 8),      # 非法值按 0 处理
+    ])
+    def test_count_truncates_to_most_recent_bars(self, count, expected):
+        payload = _consecutive_daily_klines(8)
+        with mock.patch.object(stock_api.requests, "get",
+                               return_value=_FakeResponse(payload=payload)):
+            result = stock_api.query_kline_data("600000", count=count)
+
+        assert result["error"] is None
+        dates = [k["date"] for k in result["klines"]]
+        assert len(dates) == expected
+        # 裁剪必须保留"最近"的部分，不能从头部截
+        assert dates == sorted(dates)[-expected:]
+
+    def test_weekly_period_fetches_count_daily_bars_then_aggregates(self):
+        # 周K/月K 仍由日线聚合，count 生效在日线层，聚合结果只取最近几根
+        payload = _consecutive_daily_klines(60)
+        with mock.patch.object(stock_api.requests, "get",
+                               return_value=_FakeResponse(payload=payload)) as get:
+            result = stock_api.query_kline_data("600000", period="weekly", count=600)
+
+        assert "datalen=600" in get.call_args.args[0]
+        assert result["error"] is None
+        assert len(result["klines"]) < 60                     # 确实聚合过了
+        assert [k["date"] for k in result["klines"]] == sorted(k["date"] for k in result["klines"])
 
     def test_index_code_uses_index_prefix(self):
         with mock.patch.object(stock_api.requests, "get",

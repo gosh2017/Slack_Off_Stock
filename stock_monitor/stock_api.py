@@ -174,6 +174,19 @@ _KLINE_PERIOD_MAP = {
     "monthly": {"label": "月K", "fetch_count": 800},
 }
 
+# 新浪 getKLineData 的 datalen 不能无限大，超出会被截断或直接返回空，
+# 所以在把它拼进 URL 之前先收敛一下
+_KLINE_FETCH_CAP = 2000
+
+
+def _clamp_count(count) -> int:
+    """把请求条数收敛到 [0, _KLINE_FETCH_CAP]，非法输入按 0 处理。"""
+    try:
+        value = int(count or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return max(0, min(value, _KLINE_FETCH_CAP))
+
 
 def _aggregate_klines(klines: list, period: str) -> list:
     """
@@ -257,7 +270,10 @@ def query_kline_data(stock_code: str, stock_type: str = "stock",
         stock_code: 股票代码（纯数字）
         stock_type: 查询类型，"stock" / "index" / "etf"
         period:     K线周期，"daily"（默认）/ "weekly" / "monthly"
-        count:      返回的数据条数（默认 120）
+        count:      返回的数据条数（默认 120）。
+                    请求时会按 max(该周期默认条数, count) 拉取日线，
+                    最后只返回最近的 count 根，所以回放这类需要更长历史
+                    的场景可以直接传更大的 count
 
     返回：
         {
@@ -284,9 +300,9 @@ def query_kline_data(stock_code: str, stock_type: str = "stock",
         # 使用已有的 _build_code 获取新浪格式代码
         full_code = _build_code(stock_code, stock_type)
 
-        # 日K线需要足够的数据量来聚合周K/月K
+        # 日K线需要足够的数据量来聚合周K/月K；count 更大时按 count 拉取
         period_info = _KLINE_PERIOD_MAP.get(period, _KLINE_PERIOD_MAP["daily"])
-        fetch_count = period_info["fetch_count"]
+        fetch_count = max(period_info["fetch_count"], _clamp_count(count))
 
         # 新浪财经日K线 API
         url = (
@@ -330,12 +346,16 @@ def query_kline_data(stock_code: str, stock_type: str = "stock",
 
         # 按需聚合
         if period == "daily":
-            result["klines"] = daily_klines
+            klines = daily_klines
         else:
             aggregated = _aggregate_klines(daily_klines, period)
             if not aggregated:
                 raise ValueError(f"{period} 聚合失败，数据不足")
-            result["klines"] = aggregated
+            klines = aggregated
+
+        # 只保留最近的 count 根（接口能给的比 count 多时才有裁剪效果）
+        want = _clamp_count(count)
+        result["klines"] = klines[-want:] if want else klines
 
     except requests.exceptions.Timeout:
         result["error"] = f"请求超时（{TIMEOUT}秒），请检查网络连接"

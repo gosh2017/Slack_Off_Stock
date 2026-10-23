@@ -38,6 +38,11 @@ import threading
 from pathlib import Path
 
 from stock_monitor.stock_api import query_kline_data
+from stock_monitor.replay import (
+    ReplaySession, ReplayDriver,
+    replay_count, clamp_interval,
+    DEFAULT_INTERVAL, STATE_IDLE,
+)
 
 # ──────────────── 可选依赖：pywebview ────────────────
 try:
@@ -225,6 +230,11 @@ class HqChartKlineWindow:
 
     对外接口与 gui.py 中的 matplotlib 版 KlineWindow 对齐：
         alive() / activate() / close() / fetch(period)
+
+    历史回放接口（两个后端一致）：
+        start_replay() / pause_replay() / resume_replay() / stop_replay()
+    回放的定拍在父进程（见 stock_monitor/replay.py 的 ReplayDriver），
+    子进程只负责照着画。
     """
 
     def __init__(self, root, code: str, stock_type: str, name: str = ""):
@@ -250,6 +260,17 @@ class HqChartKlineWindow:
         self._closed = False          # 是否收到子进程的 close 事件
         self._exit_notified = False
         self._stderr = tempfile.TemporaryFile()
+
+        # ── 历史回放 ──
+        # 回放由父进程定拍：每隔一段时间把"揭示前 N 根"的载荷推给子进程，
+        # 子进程只是照着画。完整 K 线一直留在本地，暂停/继续都不用重新拉数据。
+        self._last_klines = []        # 最近一次取到的完整 K 线（未切片）
+        self._replay_wanted = False   # 数据回来后是否要开始回放
+        self._replay_interval = DEFAULT_INTERVAL
+        self.replay = ReplayDriver(
+            self._root, self._render_replay, on_state=self._on_replay_state,
+            interval=DEFAULT_INTERVAL,
+        )
 
         self.proc = self._spawn()
         threading.Thread(target=self._reader, daemon=True).start()
@@ -319,6 +340,17 @@ class HqChartKlineWindow:
                 self._root.after(0, self._on_period_event, period)
         elif event == "refresh":
             self._root.after(0, self.fetch)
+        elif event == "replay_start":
+            interval = msg.get("interval")
+            self._root.after(0, self.start_replay, interval)
+        elif event == "replay_pause":
+            self._root.after(0, self.pause_replay)
+        elif event == "replay_resume":
+            self._root.after(0, self.resume_replay)
+        elif event == "replay_stop":
+            self._root.after(0, self.stop_replay)
+        elif event == "replay_speed":
+            self._root.after(0, self.set_replay_interval, msg.get("interval"))
         elif event == "chart_error":
             self._root.after(0, self._on_chart_error, msg.get("message", ""))
         elif event == "error":
@@ -372,6 +404,9 @@ class HqChartKlineWindow:
         detail = self._stderr_tail()      # 必须先取，之后再关管道
         self._cleanup(proc)
 
+        # 回放定时器必须停掉，否则这个已经死掉的窗口还会一直给自己发消息
+        self._root.after(0, self._shutdown_replay)
+
         if closed:
             self._root.after(0, self._handle_closed)
             return
@@ -412,15 +447,23 @@ class HqChartKlineWindow:
 
     # ── 数据获取 ──
 
-    def fetch(self, period: str = None):
-        """按指定周期拉取并推送 K 线数据"""
+    def fetch(self, period: str = None, count: int = None):
+        """按指定周期拉取并推送 K 线数据。
+
+        count 不为空时按它决定拉多少根（回放要用比平时多得多），
+        否则用该周期的默认条数。
+        """
         if period:
             self.period = period
+        # 换周期 / 手动刷新都会整图重画，进行中的回放先退出
+        if self.replay.active:
+            self.replay.stop(render_all=False)
         if self._loading:
             return
         self._loading = True
-        count = PERIOD_COUNT_MAP.get(self.period, PERIOD_COUNT_MAP[DEFAULT_PERIOD])
-        threading.Thread(target=self._fetch_thread, args=(count,),
+        want = count if count else PERIOD_COUNT_MAP.get(
+            self.period, PERIOD_COUNT_MAP[DEFAULT_PERIOD])
+        threading.Thread(target=self._fetch_thread, args=(want,),
                          daemon=True).start()
 
     def _fetch_thread(self, count: int):
@@ -433,15 +476,121 @@ class HqChartKlineWindow:
         if not isinstance(result, dict):
             return
         if result.get("error"):
+            # 为回放拉取失败也要复位，否则"回放"按钮会一直亮着
+            self._replay_wanted = False
             payload = build_chart_payload(self.code, self.stock_type,
                                           self.name, self.period, [])
             payload["error"] = result["error"]
             self._send({"cmd": "data", "payload": payload})
             return
 
+        klines = result.get("klines") or []
+        self._last_klines = klines
+
+        # 回放模式下多要了一批数据：直接开播，且先不推全量——否则第一帧会
+        # 闪一下"全部可见"，回放就没意思了
+        if self._replay_wanted:
+            self._replay_wanted = False
+            self.start_replay(self._replay_interval, klines)
+            return
+
         payload = build_chart_payload(self.code, self.stock_type,
-                                      self.name, self.period,
-                                      result.get("klines") or [])
+                                      self.name, self.period, klines)
+        self._send({"cmd": "data", "payload": payload})
+
+    # ── 历史回放 ──
+
+    def start_replay(self, interval=None, klines=None):
+        """从最早的 bar 开始回放，一直播到最新一根。
+
+        平时看盘只要最近 120 根，回放要从最左边播起来，所以先多要一批历史
+        再开播。已经拿到数据（klines 不为空）时直接开播，省掉一次网络往返。
+        """
+        self._replay_interval = clamp_interval(interval)
+        if klines is None:
+            self._replay_wanted = True
+            self.fetch(count=replay_count(self.period))
+            return
+        self._begin_replay(klines)
+
+    def _begin_replay(self, klines: list):
+        """数据就位：建一个回放进度并开播"""
+        klines = klines or []
+        if len(klines) < 3:
+            self._notify_status("数据不足，无法回放")
+            return
+        self._last_klines = klines
+        session = ReplaySession(len(klines))
+        self.replay.interval = self._replay_interval
+        self.replay.start(session, self._replay_interval)
+
+    def pause_replay(self):
+        """暂停回放（画面停在当前位置）"""
+        self.replay.pause()
+
+    def resume_replay(self):
+        """继续回放"""
+        self.replay.resume()
+
+    def stop_replay(self, render_all: bool = True):
+        """结束回放。默认把完整数据画回去（相当于"回到最新"）"""
+        self.replay.stop(render_all=render_all)
+
+    def set_replay_interval(self, ms):
+        """调整播放速度"""
+        self._replay_interval = clamp_interval(ms)
+        self.replay.set_interval(ms)
+
+    def _shutdown_replay(self):
+        """收尾：停掉回放定时器，别再往死掉的管道发消息"""
+        replay = getattr(self, "replay", None)
+        if replay is not None:
+            replay.stop(render_all=False)
+
+    def _render_replay(self, count: int):
+        """回放每推进一步：把前 count 根推给子进程重画。
+
+        进度归零（stop 之后回调）时发一份完整载荷，让图表退出回放模式。
+        """
+        klines = self._last_klines
+        if not klines:
+            return
+        if self.replay.session is None:
+            self._send({"cmd": "data", "payload": build_chart_payload(
+                self.code, self.stock_type, self.name, self.period, klines)})
+            return
+        self._send_replay_payload(self.replay.session.count, self.replay.state)
+
+    def _send_replay_payload(self, count: int, state: str):
+        """推送"揭示前 count 根"的回放载荷"""
+        klines = self._last_klines
+        count = max(1, min(count, len(klines)))
+        payload = build_chart_payload(self.code, self.stock_type,
+                                      self.name, self.period, klines[:count])
+        payload["replay"] = True
+        payload["replayCount"] = count
+        payload["replayTotal"] = len(klines)
+        payload["replayDate"] = klines[count - 1].get("date", "")
+        payload["replayState"] = state
+        self._send({"cmd": "data", "payload": payload})
+
+    def _on_replay_state(self, state: str, session):
+        """回放状态变了（暂停/继续/结束）：只同步状态，不重画图表"""
+        if session is None or not self._last_klines:
+            return
+        klines = self._last_klines
+        count = max(1, min(session.count, len(klines)))
+        self._send({"cmd": "replay_state",
+                    "state": state,
+                    "count": count,
+                    "total": len(klines),
+                    "date": klines[count - 1].get("date", "")})
+
+    def _notify_status(self, message: str):
+        """推一条提示信息给子进程：只在状态栏显示，不动当前图表"""
+        payload = build_chart_payload(self.code, self.stock_type,
+                                      self.name, self.period, [])
+        payload["error"] = message
         self._send({"cmd": "data", "payload": payload})
 
     # ── 对外接口 ──
@@ -468,6 +617,7 @@ class HqChartKlineWindow:
         """
         if self.proc is None:
             return
+        self._shutdown_replay()
         proc = self.proc
         self.proc = None
         try:

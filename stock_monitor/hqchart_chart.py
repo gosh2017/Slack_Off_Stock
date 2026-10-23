@@ -11,9 +11,10 @@ HQChart K线窗口 — 承载进程
 
 通信协议（JSON 行，UTF-8）：
     父 → 子：
-        {"cmd": "data", "payload": {...}}   推送一份 K 线数据
-        {"cmd": "focus"}                    请求把窗口提到前台
-        {"cmd": "close"}                    关闭窗口
+        {"cmd": "data", "payload": {...}}       推送一份 K 线数据
+        {"cmd": "replay_state", ...}           推送回放状态（不重画图表）
+        {"cmd": "focus"}                       请求把窗口提到前台
+        {"cmd": "close"}                       关闭窗口
     子 → 父：
         {"event": "ready"}                  窗口已创建
         {"event": "chart_ready"}            图表适配层已就绪，可以接收数据
@@ -260,6 +261,20 @@ class ChartApp:
             # 评估失败时保留载荷，等待下一次 chart_ready 重试
             self._pending_payload = payload
 
+    def _push_replay_state(self, msg: dict):
+        """把回放状态交给页面：只更新按钮和状态栏，不重画图表。
+
+        和 _push_to_js 不同，这里不做"未就绪就缓存"——状态消息是实时的，
+        错过一次也没关系，下一帧的数据载荷会带上同样的状态。
+        """
+        if not self._ready_notified:
+            return
+        try:
+            js = "window.applyReplayState(%s);" % json.dumps(msg, ensure_ascii=False)
+            self.window.evaluate_js(js)
+        except Exception:
+            pass
+
     # ──────────────── 父进程命令 ────────────────
 
     def _read_stdin(self):
@@ -286,6 +301,8 @@ class ChartApp:
         cmd = msg.get("cmd")
         if cmd == "data":
             self._push_to_js(msg.get("payload") or {})
+        elif cmd == "replay_state":
+            self._push_replay_state(msg)
         elif cmd == "focus":
             self._focus_window()
         elif cmd == "close":

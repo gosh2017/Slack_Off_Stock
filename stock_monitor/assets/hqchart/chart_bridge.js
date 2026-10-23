@@ -6,7 +6,8 @@
  * 职责：
  *   1. 把 Python 推来的数据（JSON）适配成 HQChart 需要的格式
  *   2. 负责图表实例的创建 / 重建（周期切换时整体重建）
- *   3. 把工具栏按钮事件上报给 Python（notify）
+ *   3. 历史回放：每帧数据由 Python 按进度切好推来，就地重画 + 更新进度
+ *   4. 把工具栏按钮事件上报给 Python（notify）
  *
  * ★★★ 为什么所有 HQChart 调用都收拢在这个文件 ★★★
  *   按 HQChart 开源版的接口编写（github.com/jones2000/HQChart，Apache 2.0）：
@@ -45,6 +46,15 @@
         chart: null,      // JSChart 实例
         period: "daily",
         symbol: ""
+    };
+
+    // 回放状态。定拍在 Python 侧（每隔一段时间推来"前 N 根"的数据），
+    // 这里只负责照着画和更新按钮
+    var REPLAY = {
+        state: "idle",    // idle / running / paused / finished
+        count: 0,         // 当前已揭示的 bar 数
+        total: 0,         // 总 bar 数
+        date: ""          // 当前最后一根 bar 的日期
     };
 
     // ════════════════ 与 Python 通信 ════════════════
@@ -146,6 +156,75 @@
         }
     }
 
+    // ════════════════ 回放工具栏 ════════════════
+
+    /** 读速度下拉框（毫秒/根），取不到时用默认值 */
+    function getReplaySpeed() {
+        var sel = document.getElementById("sel-speed");
+        var v = sel ? parseInt(sel.value, 10) : 400;
+        return (isFinite(v) && v > 0) ? v : 400;
+    }
+
+    /** 回放进度文案 */
+    function replayStatusText(state, count, total, date) {
+        if (!total) {
+            return "";
+        }
+        var head = (state === "finished") ? "回放完成" : "回放";
+        var text = head + (date ? " " + date : "");
+        return text + "  " + count + "/" + total;
+    }
+
+    /**
+     * 判断当前状态下「回放」按钮该不该可点。
+     * idle 能开始；finished 也能再点一次重播（不必先回"最新"）；
+     * running / paused 期间点了没意义。
+     */
+    function canStartReplay(state) {
+        return state === "idle" || state === "finished";
+    }
+
+    /**
+     * 同步回放三个按钮的可点状态和文案。
+     * 暂停/继续共用一个按钮；"最新"在回放中才能点。
+     */
+    function syncReplayButtons(state) {
+        var replay = document.getElementById("btn-replay");
+        var pause = document.getElementById("btn-pause");
+        var latest = document.getElementById("btn-latest");
+
+        if (replay) {
+            // 播完后也能再点一次重播，不必先回"最新"
+            replay.disabled = !canStartReplay(state);
+        }
+        if (pause) {
+            pause.disabled = (state !== "running" && state !== "paused");
+            pause.textContent = (state === "paused") ? "继续" : "暂停";
+        }
+        if (latest) {
+            latest.disabled = (state === "idle");
+        }
+    }
+
+    /** 按回放状态同步工具栏按钮和状态栏文字 */
+    function setReplayUI(state, count, total, date) {
+        syncReplayButtons(state);
+        setStatus(replayStatusText(state, count, total, date));
+    }
+
+    /**
+     * 放开按钮：先放开全部工具栏按钮，再按当前回放状态收紧。
+     *
+     * 顺序不能反过来——setButtonsDisabled 选的是全部 .tb-btn（含回放三个
+     * 按钮），排在后面会把 syncReplayButtons 刚设好的禁用状态清掉，
+     * 导致播放中「回放」也能点、回放结束后「暂停」「最新」也能点。
+     * 统一走这个入口，避免各调用点自己拼顺序。
+     */
+    function releaseButtons() {
+        setButtonsDisabled(false);
+        syncReplayButtons(REPLAY.state);
+    }
+
     function bindToolbar() {
         var btns = document.querySelectorAll(".tb-btn[data-period]");
         for (var i = 0; i < btns.length; i++) {
@@ -163,6 +242,44 @@
             refresh.addEventListener("click", function () {
                 setButtonsDisabled(true);
                 notify("refresh", {});
+            });
+        }
+
+        // ── 回放控制 ──
+        // 点谁做什么都以按钮自身呈现的状态为准（disabled / 文案），不用 REPLAY.state
+        // 判断——按钮状态由 setReplayUI() 从同一份状态算出，用户看到什么就按什么发，
+        // 即使内部状态和 UI 不同步也不会发出用户理解不了的指令。
+        var replay = document.getElementById("btn-replay");
+        if (replay) {
+            replay.addEventListener("click", function () {
+                if (replay.disabled) {
+                    return;
+                }
+                notify("replay_start", { interval: getReplaySpeed() });
+            });
+        }
+        var pause = document.getElementById("btn-pause");
+        if (pause) {
+            pause.addEventListener("click", function () {
+                if (pause.disabled) {
+                    return;
+                }
+                notify(pause.textContent === "继续" ? "replay_resume" : "replay_pause", {});
+            });
+        }
+        var latest = document.getElementById("btn-latest");
+        if (latest) {
+            latest.addEventListener("click", function () {
+                if (latest.disabled) {
+                    return;
+                }
+                notify("replay_stop", {});
+            });
+        }
+        var speed = document.getElementById("sel-speed");
+        if (speed) {
+            speed.addEventListener("change", function () {
+                notify("replay_speed", { interval: getReplaySpeed() });
             });
         }
     }
@@ -406,25 +523,58 @@
     }
 
     /**
+     * 把一组数据画出来。
+     *
+     * 首次画（还没有图表实例）走完整的 Init + SetOption；之后复用同一个实例
+     * 直接 SetOption —— 库会在原画布上重画，不新建画布、不重建 DOM，
+     * 所以回放每一步都很轻，也不会闪白。
+     *
+     * @returns {object|null} 画成功返回图表实例，失败返回 null
+     */
+    function renderRows(rows, name, period) {
+        if (!STATE.chart) {
+            var notice = document.getElementById("notice");
+            if (notice) {
+                notice.style.display = "none";
+            }
+            var chart = makeChart(STATE.symbol, rows, name, period);
+            if (!chart) {
+                return null;
+            }
+            STATE.chart = chart;
+            return chart;
+        }
+        try {
+            var updated = STATE.chart.SetOption(
+                buildOption(STATE.symbol, rows, name, period));
+            if (updated) {
+                return updated;
+            }
+        } catch (e) {
+            // 就地更新失败（库版本差异等），落到整体重建兜底
+        }
+        destroyChart();
+        var rebuilt = makeChart(STATE.symbol, rows, name, period);
+        STATE.chart = rebuilt;
+        return rebuilt;
+    }
+
+    function showChartMissing() {
+        showNotice(MISSING_HTML);
+        notify("chart_error", { message: "未加载到 HQChart 库" });
+        releaseButtons();
+        return false;
+    }
+
+    /**
      * 应用一份完整的数据载荷：重建图表 → 写入数据。
      * 周期切换时整体重建，避免残留上一个周期的指标与坐标。
      */
-    function applyPayload(payload) {
-        if (!payload) {
-            setStatus("");
-            setButtonsDisabled(false);
-            return;
-        }
-        // Python 侧拉数据失败：保留上一张图，只显示错误信息
-        if (payload.error) {
-            setStatus("查询失败：" + payload.error);
-            setButtonsDisabled(false);
-            return;
-        }
+    function applyFull(payload) {
         var items = payload.items || [];
         if (!items.length) {
             setStatus("数据不足");
-            setButtonsDisabled(false);
+            releaseButtons();
             return;
         }
 
@@ -436,31 +586,107 @@
         var rows = buildRows(items);
         if (!rows.length) {
             setStatus("数据不足（日期格式无法解析）");
-            setButtonsDisabled(false);
+            releaseButtons();
             notify("chart_error", { message: "K线数据日期格式无法解析" });
             return;
         }
 
+        // 完整载荷意味着退出回放模式（周期切换 / 刷新 / 点"最新"）
         destroyChart();
-        var notice = document.getElementById("notice");
-        if (notice) {
-            notice.style.display = "none";
-        }
+        STATE.chart = null;
 
         var chart = makeChart(STATE.symbol, rows,
                               payload.name || STATE.symbol, STATE.period);
         if (!chart) {
-            showNotice(MISSING_HTML);
-            notify("chart_error", { message: "未加载到 HQChart 库" });
-            setButtonsDisabled(false);
-            return;
+            return showChartMissing();
         }
         STATE.chart = chart;
 
+        REPLAY.state = "idle";
+        REPLAY.count = 0;
+        REPLAY.total = 0;
+        REPLAY.date = "";
+
         setTitle(payload);
         setActiveButton(STATE.period);
-        setStatus("");
-        setButtonsDisabled(false);
+        releaseButtons();
+        setReplayUI("idle", 0, 0, "");
+    }
+
+    /**
+     * 应用一帧回放数据。
+     *
+     * Python 已经把 K 线按进度切好推过来，这里只做就地重画 + 更新进度文案。
+     * 不重建图表实例，否则几百步回放要 Init 几百次，会明显卡顿和闪屏。
+     */
+    function applyReplay(payload) {
+        var items = payload.items || [];
+        var rows = buildRows(items);
+        if (!rows.length) {
+            setStatus("回放数据不足");
+            releaseButtons();
+            return;
+        }
+
+        STATE.period = payload.period || STATE.period;
+        STATE.symbol = toHqchartSymbol(payload.code, payload.stockType);
+
+        var chart = renderRows(rows, payload.name || STATE.symbol, STATE.period);
+        if (!chart) {
+            return showChartMissing();
+        }
+
+        var state = payload.replayState || "running";
+        var count = parseInt(payload.replayCount, 10);
+        var total = parseInt(payload.replayTotal, 10);
+        if (!isFinite(count) || count <= 0) { count = rows.length; }
+        if (!isFinite(total) || total <= 0) { total = rows.length; }
+
+        REPLAY.state = state;
+        REPLAY.count = count;
+        REPLAY.total = total;
+        REPLAY.date = payload.replayDate || "";
+
+        setTitle(payload);
+        setActiveButton(STATE.period);
+        releaseButtons();
+        setReplayUI(state, count, total, REPLAY.date);
+    }
+
+    /**
+     * 只更新回放状态（暂停 / 继续 / 结束），不动图表。
+     * 由父进程在状态变化时单独推过来，省掉一次整图重画。
+     */
+    function applyReplayState(msg) {
+        msg = msg || {};
+        var state = msg.state || "idle";
+        REPLAY.state = state;                          // 必须写回，否则按钮文案和状态会不同步
+        if (typeof msg.count === "number") { REPLAY.count = msg.count; }
+        if (typeof msg.total === "number") { REPLAY.total = msg.total; }
+        if (typeof msg.date === "string")  { REPLAY.date = msg.date; }
+        setReplayUI(state, REPLAY.count, REPLAY.total, REPLAY.date);
+    }
+
+    /**
+     * 入口：Python 侧通过 window.evaluate_js 调用。
+     */
+    function applyPayload(payload) {
+        if (!payload) {
+            setStatus("");
+            releaseButtons();
+            return;
+        }
+        // Python 侧拉数据失败 / 提示：保留当前图，只在状态栏显示
+        if (payload.error) {
+            setStatus(payload.error);
+            releaseButtons();
+            return;
+        }
+        if (payload.replay === true) {
+            applyReplay(payload);
+            return;
+        }
+        applyFull(payload);
     }
 
     // ════════════════ 入口 ════════════════
@@ -469,6 +695,7 @@
         bindToolbar();
         bindWindowResize();
         applyStyle();
+        setReplayUI("idle", 0, 0, "");   // 初始化回放按钮状态
 
         // chart_ready 的含义是"适配层可以接收 applyPayload"。
         // 库缺失时也先上报，让 Python 立刻把数据推过来，
@@ -492,4 +719,5 @@
 
     // Python 侧通过 window.evaluate_js 调用
     window.applyPayload = applyPayload;
+    window.applyReplayState = applyReplayState;
 })();

@@ -31,6 +31,8 @@ body {
     background: #F5F5F5;
     border-bottom: 1px solid #E3E3E3;
     flex: 0 0 auto;
+    /* 窄窗口里按钮排不下时折成两行，而不是被裁掉 */
+    flex-wrap: wrap;
 }
 
 #title {
@@ -73,6 +75,28 @@ body {
     color: #AAAAAA;
     background: #E6E6E6;
     cursor: default;
+}
+
+/* 工具栏里的分组竖线（普通查看 | 回放） */
+.tb-sep {
+    width: 1px;
+    height: 16px;
+    margin: 0 2px;
+    background: #CCCCCC;
+    flex: 0 0 auto;
+}
+
+/* 回放速度下拉框，跟按钮一样的高度 */
+.tb-select {
+    font-family: inherit;
+    font-size: 12px;
+    padding: 3px 4px;
+    height: 27px;
+    background: #E0E0E0;
+    color: #333;
+    border: 1px solid #CCCCCC;
+    border-radius: 2px;
+    cursor: pointer;
 }
 
 /* ── 图表区域 ── */

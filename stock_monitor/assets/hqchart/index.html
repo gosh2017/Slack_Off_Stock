@@ -8,7 +8,7 @@
 <link rel="stylesheet" href="./app.css">
 </head>
 <body>
-    <!-- 顶部工具栏：周期切换 / 刷新，样式与 tkinter 主窗口保持一致 -->
+    <!-- 顶部工具栏：周期切换 / 刷新 / 历史回放，样式与 tkinter 主窗口保持一致 -->
     <div id="toolbar">
         <span id="title">--</span>
         <span id="status"></span>
@@ -17,6 +17,16 @@
         <button class="tb-btn" data-period="weekly" id="btn-weekly">周K</button>
         <button class="tb-btn" data-period="monthly" id="btn-monthly">月K</button>
         <button class="tb-btn" id="btn-refresh">刷新</button>
+        <span class="tb-sep"></span>
+        <select id="sel-speed" class="tb-select" title="回放速度（每根K线间隔）">
+            <option value="2000">慢</option>
+            <option value="1000">中</option>
+            <option value="400" selected>快</option>
+            <option value="150">极快</option>
+        </select>
+        <button class="tb-btn" id="btn-replay">回放</button>
+        <button class="tb-btn" id="btn-pause" disabled>暂停</button>
+        <button class="tb-btn" id="btn-latest">最新</button>
     </div>
 
     <!-- HQChart 图表容器 -->
