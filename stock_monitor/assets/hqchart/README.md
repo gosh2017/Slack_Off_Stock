@@ -145,3 +145,26 @@ K 线窗口放在**独立进程**是因为 pywebview 的 `webview.start()` 和 t
 `destroyChart()` + `JSChart.Init()` 重建：重建会让几百步回放每次都重建 canvas 和
 事件绑定，既卡又闪。matplotlib 版本走的是 `KlineWindow`，两端的回放操作一致，
 差异只在各自的画图画法。
+
+## 分时图（指定日期）
+
+同一张窗口还能看某一天的分时。工具栏输入日期点「分时」→ Python 拉分钟数据
+（东方财富优先，它的行情域名连不上时退回新浪，见仓库根 `minute_api.py` 的模块
+头注释）→ 推一个 `chartType: "minute"` 的载荷；分时回放复刻上面的回放机制，
+只是间隔比日K快一个量级。
+
+- 载荷：`applyPayload()` 按 `payload.chartType === "minute"` 分流到
+  `applyMinuteFull()` / `applyMinuteReplay()`；分时数据在 `payload.items` 里，
+  单位是股，另带 `date` / `preClose`（昨收基准线）/ `klt` / `note`。
+  `note` 是状态栏提示（休市日回退说明、走了新浪兜底源），`applyMinuteFull()`
+  末尾 `setStatus(payload.note)` 显示——必须排在 `setReplayUI("idle",…)` 后面，
+  因为后者内部也调 `setStatus`，顺序反了提示语显示不出来
+- 分时图走的是 `Type: "分钟走势图"`（不是 `"历史K线图"`），数据格式是
+  `stock[0].minute` 数组：`{price, open, high, low, vol, amount, avprice, time}`
+  —— `time` 必须是 **HHMM 整数**（如 931），`date` 是 YYYYMMDD 整数
+- 单日分时只有 240 根左右，而 X 轴的 0 号槽位刻着 "09:30"，所以 JS 侧会补一根
+  09:30 合成点（取当天开盘价），让 09:31~15:00 正好落在 1..240 号槽位上
+- 页面 → 主进程的事件：`minute_open`（带 `date`）、`minute_close`；
+  Python 侧拿到周期切换 / 刷新事件时会先退出分时模式
+- 速度下拉框的值随图形类型切换（`syncSpeedSelect()`）：分时是
+  500 / 200 / 80 / 30 毫秒一根，比日K的 2000 / 1000 / 400 / 150 快一个量级

@@ -17,13 +17,15 @@ import queue
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from stock_monitor.stock_api import query_stock, query_kline_data
+from stock_monitor.minute_api import query_minute_data
 from stock_monitor.stock_search import search_stocks
 from stock_monitor.hqchart_bridge import (
     HqChartKlineWindow,
     is_available as hqchart_available,
 )
 from stock_monitor.replay import (
-    ReplaySession, ReplayDriver, replay_count, clamp_interval,
+    ReplaySession, ReplayDriver, new_session, replay_count, clamp_interval,
+    replay_speed_ms, interval_bounds,
     DEFAULT_INTERVAL,
 )
 from stock_monitor.history_manager import save_query, load_history, clear_history, remove_history_record
@@ -79,6 +81,14 @@ class KlineWindow:
         self.kline_data = []
         self.period = "daily"
         self._loading = False
+
+        # 分时模式：K线窗口也能看某一天的分时（数据/进度/回放与 K线共用
+        # 一套驱动，只是画法和参数不同）
+        self.chart_mode = "kline"     # "kline" | "minute"
+        self.minute_bars = []         # 最近一次分时数据
+        self.minute_date = ""
+        self.minute_klt = 1
+        self.minute_pre_close = 0.0
 
         # 窗口
         self.win = tk.Toplevel()
@@ -142,6 +152,21 @@ class KlineWindow:
         )
         self.refresh_btn.pack(side=tk.RIGHT, padx=4)
 
+        # ── 分时 ──
+        self.minute_btn = tk.Button(
+            toolbar, text="分时", font=("微软雅黑", 8), width=4,
+            bg="#E0E0E0", fg="#333", command=self.open_minute,
+        )
+        self.minute_btn.pack(side=tk.RIGHT, padx=1)
+
+        self.date_var = tk.StringVar(value="")
+        self.date_entry = tk.Entry(
+            toolbar, textvariable=self.date_var, width=10, justify=tk.CENTER,
+            font=("Consolas", 8),
+        )
+        self.date_entry.pack(side=tk.RIGHT, padx=1)
+        self.date_entry.bind("<Return>", lambda e: self.open_minute())
+
         # ── 历史回放 ──
         self._replay_speeds = [("慢", 2000), ("中", 1000),
                                ("快", 400), ("极快", 150)]
@@ -178,7 +203,9 @@ class KlineWindow:
     def _fetch_kline(self, count=None):
         if not MATPLOTLIB_OK or self._loading or not self.code:
             return
-        # 换周期 / 手动刷新都会整图重画，进行中的回放先退出
+        # 换周期 / 手动刷新 / 从分时返回 都会整图重画：先退出分时模式和进行中的回放
+        self.chart_mode = "kline"
+        self.minute_bars = []
         if self.replay.active:
             self.replay.stop(render_all=False)
         self._loading = True
@@ -228,6 +255,115 @@ class KlineWindow:
         self.status_label.config(text="")
         self._init_figure()
         self._draw()
+
+    # ── 分时 ──
+
+    def open_minute(self):
+        """打开指定日期的分时图（日期留空用今天，休市自动回退最近交易日）"""
+        if not MATPLOTLIB_OK or self._loading or not self.code:
+            return
+        if self.replay.active:
+            self.replay.stop(render_all=False)
+        date = self.date_var.get().strip()
+        self.chart_mode = "minute"
+        self._loading = True
+        self.status_label.config(text="分时加载中...")
+        self._set_btn_state(tk.DISABLED)
+        threading.Thread(
+            target=self._minute_fetch_thread,
+            args=(date,), daemon=True,
+        ).start()
+
+    def _minute_fetch_thread(self, date: str):
+        result = query_minute_data(self.code, self.stock_type, date)
+        self.win.after(0, self._on_minute_ready, result)
+
+    def _on_minute_ready(self, result):
+        self._loading = False
+        self._set_btn_state(tk.NORMAL)
+        # 数据回来时如果用户已经切走（点了周期/刷新），这次结果作废，
+        # 并把 K线请求补上（_switch_period 在 _loading 时会跳过拉取）
+        if self.chart_mode != "minute":
+            self._fetch_kline()
+            return
+        if result["error"]:
+            self.chart_mode = "kline"
+            self.status_label.config(text=result["error"])
+            return
+        self.minute_bars = result["bars"]
+        self.minute_date = result["date"]
+        self.minute_klt = result["klt"]
+        self.minute_pre_close = result["pre_close"]
+        self.status_label.config(text=result.get("note", ""))
+        self._init_figure()
+        self._draw_minute()
+
+    def _draw_minute(self, limit=None):
+        """画分时图：价格线 + 均价线 + 昨收基准线 + 成交量柱"""
+        bars = self.minute_bars
+        if limit is not None:
+            bars = bars[:max(1, min(int(limit), len(bars)))]
+        if len(bars) < 2:
+            self.status_label.config(text="数据不足")
+            return
+
+        self.kline_ax_price.clear()
+        self.kline_ax_volume.clear()
+
+        x = list(range(len(bars)))
+        closes = [b["close"] for b in bars]
+        avs = [b["av_price"] for b in bars]
+        vols = [b["volume"] for b in bars]
+        times = [b["time"] for b in bars]
+        pre = self.minute_pre_close
+
+        self.kline_ax_price.plot(x, closes, color=COLOR_MA5, linewidth=1.0)
+        self.kline_ax_price.plot(x, avs, color=COLOR_MA10, linewidth=0.8,
+                                 linestyle="--")
+        if pre:
+            self.kline_ax_price.axhline(pre, color="#999999",
+                                        linewidth=0.6, linestyle=":")
+
+        self.kline_ax_price.set_title(
+            f"{self.name or ''} ({self.code}) — 分时 {self.minute_date}",
+            fontsize=11, fontweight="bold", pad=4)
+        self.kline_ax_price.grid(True, color="#F0F0F0", linewidth=0.5)
+        self.kline_ax_price.set_xlim(-1, len(x))
+        self.kline_ax_price.tick_params(labelbottom=False, labelsize=7)
+
+        max_vol = max(vols) if vols else 1
+        for i in range(len(bars)):
+            color = "#FFCCCC" if closes[i] >= avs[i] else "#CCE0CC"
+            self.kline_ax_volume.bar(x[i], vols[i] / max_vol,
+                                     width=0.6, color=color,
+                                     edgecolor=color)
+
+        self.kline_ax_volume.grid(True, color="#F0F0F0", linewidth=0.5)
+        self.kline_ax_volume.set_xlim(-1, len(x))
+        self.kline_ax_volume.tick_params(labelsize=7)
+
+        # 时间轴：均匀取几个 HH:MM 刻度
+        n = max(1, len(times) // 6)
+        ticks = list(range(0, len(times), n))
+        self.kline_ax_volume.set_xticks(ticks)
+        self.kline_ax_volume.set_xticklabels(
+            [times[i] for i in ticks], fontsize=6.5)
+
+        legend_lines = [
+            Line2D([0], [0], color=COLOR_MA5, linewidth=1.2, label="价格"),
+            Line2D([0], [0], color=COLOR_MA10, linewidth=1.2,
+                   linestyle="--", label="均价"),
+        ]
+        if pre:
+            legend_lines.append(
+                Line2D([0], [0], color="#999999", linewidth=0.6,
+                       linestyle=":", label=f"昨收 {pre:.2f}"))
+        self.kline_ax_price.legend(handles=legend_lines,
+                                   loc="upper left",
+                                   fontsize=7, framealpha=0.8)
+
+        self.kline_fig.tight_layout()
+        self.kline_canvas.draw()
 
     # ── matplotlib 初始化 ──
 
@@ -357,9 +493,16 @@ class KlineWindow:
     # ── 事件 ──
 
     def _switch_period(self, period: str):
-        if period == self.period or self._loading:
+        if period == self.period and self.chart_mode != "minute":
             return
         self.period = period
+        # 分时模式下切周期 = 退出分时回到该周期的 K线。
+        # 先改模式再判 loading：分时还在加载时切走，回来的分时结果会作废，
+        # _on_minute_ready 会顺手把这次周期的 K线请求补上
+        self.chart_mode = "kline"
+        self.minute_bars = []
+        if self._loading:
+            return
         self._fetch_kline()
 
     def _set_btn_state(self, state: str):
@@ -367,28 +510,41 @@ class KlineWindow:
             btn.config(state=state)
         self.refresh_btn.config(state=state)
         self.speed_menu.config(state=state)
+        self.minute_btn.config(state=state)
+        self.date_entry.config(state=state)
 
     # ── 历史回放 ──
     # 界面从最早一根 bar 开始，按固定间隔逐根揭示到最新，可暂停 / 继续。
-    # 完整数据一直在 kline_data 里，回放只是画前 N 根，暂停继续都不用拉数据。
+    # 完整数据一直在 kline_data / minute_bars 里，回放只是画前 N 根，
+    # 暂停继续都不用拉数据。
 
     def start_replay(self):
-        """开始回放：平时只看最近 120 根，回放要多要一批历史才播得起来"""
+        """开始回放。K线模式先多要一批历史；分时模式数据已在手上，直接开播"""
         if self._loading:
             return
         if self.replay.active:
             self.replay.stop(render_all=False)
+        if self.chart_mode == "minute":
+            self._replay_interval = clamp_interval(
+                self._replay_speed_ms(), *interval_bounds("minute"))
+            self.replay.set_bounds(interval_bounds("minute"))
+            self.replay.set_interval(self._replay_interval)
+            if len(self.minute_bars) < 3:
+                self.status_label.config(text="数据不足，无法回放")
+                self._update_replay_ui()
+                return
+            session = new_session(len(self.minute_bars), "minute")
+            self.replay.start(session, self._replay_interval)
+            return
         self._replay_wanted = True
         self._replay_interval = clamp_interval(self._replay_speed_ms())
         self._update_replay_ui()
         self._fetch_kline(count=replay_count(self.period))
 
     def _replay_speed_ms(self) -> int:
-        """从速度下拉框读出"每根间隔"的毫秒数"""
-        for label, ms in self._replay_speeds:
-            if label == self.speed_var.get():
-                return ms
-        return DEFAULT_INTERVAL
+        """从速度下拉框读出"每根间隔"的毫秒数（分时比日K快一个量级）"""
+        chart = "minute" if self.chart_mode == "minute" else "kline"
+        return replay_speed_ms(chart, self.speed_var.get())
 
     def _begin_replay(self):
         """历史数据到手：建进度并开播"""
@@ -415,7 +571,13 @@ class KlineWindow:
         """回放每推进一步：画前 count 根"""
         if self.replay.session is None:
             # stop() 之后画回全量
-            self._draw()
+            if self.chart_mode == "minute":
+                self._draw_minute()
+            else:
+                self._draw()
+            return
+        if self.chart_mode == "minute":
+            self._draw_minute(self.replay.session.count)
             return
         self._draw(self.replay.session.count)
 
@@ -439,9 +601,12 @@ class KlineWindow:
 
         if replay.session is not None and active:
             s = replay.session
-            date = s.date_at(self.kline_data)
+            if self.chart_mode == "minute":
+                stamp = s.stamp_at(self.minute_bars)
+            else:
+                stamp = s.date_at(self.kline_data)
             head = "回放完成" if replay.state == "finished" else "回放"
-            self.status_label.config(text=f"{head} {date}  {s.count}/{s.total}")
+            self.status_label.config(text=f"{head} {stamp}  {s.count}/{s.total}")
         elif not active:
             self.status_label.config(text="")
 

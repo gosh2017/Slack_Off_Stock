@@ -99,6 +99,24 @@ body {
     cursor: pointer;
 }
 
+/* 分时日期输入框，跟按钮一样的高度 */
+.tb-date {
+    font-family: inherit;
+    font-size: 12px;
+    padding: 3px 6px;
+    height: 27px;
+    width: 110px;
+    background: #FFFFFF;
+    color: #333;
+    border: 1px solid #CCCCCC;
+    border-radius: 2px;
+}
+
+.tb-date:disabled {
+    color: #AAAAAA;
+    background: #E6E6E6;
+}
+
 /* ── 图表区域 ── */
 
 #mainChart {

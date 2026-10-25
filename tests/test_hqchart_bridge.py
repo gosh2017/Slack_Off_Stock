@@ -77,6 +77,12 @@ def _bare_bridge(root=None):
     bridge._send_lock = threading.RLock()
     bridge.on_crash = None
     bridge.on_closed = None
+    # 分时模式相关状态
+    bridge.chart_mode = "kline"
+    bridge._minute_date = ""
+    bridge._minute_klt = 1
+    bridge._minute_pre_close = 0.0
+    bridge._last_minute_bars = []
     return bridge
 
 
@@ -892,4 +898,327 @@ def test_dispatch_missing_replay_interval_defaults():
     bridge._dispatch({"event": "replay_start"})
 
     assert recorder.calls == [("start", None, None)]
+
+
+# ──────────────── 分时数据载荷 ────────────────
+
+def _minute_bars(n=5, date="2026-10-23", base=9.60):
+    """造 n 根分时 bars（含分时图需要的派生字段）"""
+    return [{
+        "date": date, "time": "%02d:%02d" % (9, 30 + i),
+        "open": base + i * 0.1, "close": base + i * 0.1 + 0.05,
+        "high": base + i * 0.1 + 0.2, "low": base + i * 0.1 - 0.05,
+        "volume": 1000 + i * 100, "amount": 96000.0 + i * 1000,
+        "av_price": base + i * 0.1,
+    } for i in range(n)]
+
+
+def test_build_minute_payload_maps_fields():
+    payload = hqchart_bridge.build_minute_payload(
+        "600000", "stock", "浦发银行", "2026-10-23", 9.55,
+        _minute_bars(2), klt=5)
+
+    assert payload["chartType"] == "minute"
+    assert payload["code"] == "600000"
+    assert payload["symbol"] == "CN.600000"
+    assert payload["date"] == "2026-10-23"
+    assert payload["preClose"] == 9.55
+    assert payload["klt"] == 5
+    assert len(payload["items"]) == 2
+    first = payload["items"][0]
+    assert first["time"] == "09:30"
+    assert first["close"] == 9.65
+    assert first["volume"] == 1000
+    assert first["amount"] == 96000.0
+    assert first["avPrice"] == 9.6
+
+
+def test_build_minute_payload_replay_metadata():
+    payload = hqchart_bridge.build_minute_payload(
+        "600000", "stock", "", "2026-10-23", 9.55,
+        _minute_bars(3), replay=True, count=2, total=3,
+        state="paused", time_="09:31")
+
+    assert payload["replay"] is True
+    assert payload["replayCount"] == 2
+    assert payload["replayTotal"] == 3
+    assert payload["replayDate"] == "2026-10-23"
+    assert payload["replayTime"] == "09:31"
+    assert payload["replayState"] == "paused"
+
+
+def test_build_minute_payload_dirty_input():
+    payload = hqchart_bridge.build_minute_payload(
+        "600000", "stock", "", "", 0, [None, "bad", {}])
+
+    assert payload["date"] == ""
+    assert payload["preClose"] == 0.0
+    assert len(payload["items"]) == 1
+
+
+def test_build_minute_payload_carries_note():
+    """兜底源 / 休市回退的说明要能送到网页版的状态栏"""
+    payload = hqchart_bridge.build_minute_payload(
+        "600000", "stock", "", "2026-10-23", 9.55, _minute_bars(1),
+        note="数据来自新浪（东方财富接口暂时连不上，只能回溯最近一段）")
+
+    assert payload["note"].startswith("数据来自新浪")
+
+    assert hqchart_bridge.build_minute_payload(
+        "600000", "stock", "", "2026-10-23", 9.55, _minute_bars(1))["note"] == ""
+
+
+# ──────────────── 分时：数据获取与开播 ────────────────
+
+def test_open_minute_fetches_minute_data(monkeypatch):
+    bridge = _bare_bridge()
+    root = NoopRoot()
+    bridge._root = root
+    bridge.replay = hqchart_bridge.ReplayDriver(
+        root, bridge._render_replay, on_state=bridge._on_replay_state)
+    bridge._loading = False
+    fetched = []
+    def _fake_thread(target, args, daemon):
+        fetched.append((target, args, daemon))
+        return SimpleNamespace(start=lambda: None)
+    monkeypatch.setattr(hqchart_bridge, "threading",
+                        SimpleNamespace(Thread=_fake_thread))
+
+    bridge.open_minute("2026-10-23")
+
+    assert bridge.chart_mode == "minute"
+    assert bridge._loading is True
+    assert len(fetched) == 1
+    assert fetched[0][1] == ("2026-10-23",)
+
+
+def test_open_minute_waits_while_loading():
+    bridge = _bare_bridge()
+    bridge._loading = True
+    fetched = []
+    bridge._minute_fetch_thread = lambda date: fetched.append(date)
+
+    bridge.open_minute("2026-10-23")
+
+    assert fetched == []
+    assert bridge.chart_mode == "kline"
+
+
+def test_on_minute_data_ready_sends_full_payload(monkeypatch):
+    bridge = _bare_bridge()
+    root = NoopRoot()
+    bridge._root = root
+    bridge.replay = hqchart_bridge.ReplayDriver(
+        root, bridge._render_replay, on_state=bridge._on_replay_state)
+    bridge.proc = FakeProc()
+    bridge.chart_mode = "minute"
+
+    result = {"error": None, "date": "2026-10-23", "klt": 1,
+              "pre_close": 9.55, "bars": _minute_bars(5),
+              "note": ""}
+    bridge._on_minute_data_ready(result)
+
+    msgs = _drain_messages(bridge)
+    assert len(msgs) == 1
+    payload = msgs[0]["payload"]
+    assert payload["chartType"] == "minute"
+    assert payload["date"] == "2026-10-23"
+    assert len(payload["items"]) == 5
+    assert payload["note"] == ""
+    assert bridge._last_minute_bars == _minute_bars(5)
+    assert bridge._minute_pre_close == 9.55
+    assert bridge._loading is False
+
+
+def test_on_minute_data_ready_forwards_fallback_note(monkeypatch):
+    """兜底源 / 休市回退的说明要从取数结果一路送到网页版状态栏。"""
+    bridge = _bare_bridge()
+    bridge.proc = FakeProc()
+    bridge.chart_mode = "minute"
+
+    note = "数据来自新浪（东方财富接口暂时连不上，只能回溯最近一段）"
+    bridge._on_minute_data_ready({
+        "error": None, "date": "2026-10-23", "klt": 15, "pre_close": 9.62,
+        "bars": _minute_bars(16), "note": note})
+
+    payload = _drain_messages(bridge)[0]["payload"]
+    assert payload["note"] == note
+    assert payload["klt"] == 15
+
+
+def test_on_minute_data_ready_error_reports_and_resets(monkeypatch):
+    bridge = _bare_bridge()
+    root = NoopRoot()
+    bridge._root = root
+    bridge.replay = hqchart_bridge.ReplayDriver(
+        root, bridge._render_replay, on_state=bridge._on_replay_state)
+    bridge.proc = FakeProc()
+    bridge.chart_mode = "minute"
+
+    bridge._on_minute_data_ready(
+        {"error": "没有 2020-01-01 的分时数据", "date": "",
+         "pre_close": 0, "bars": []})
+
+    msgs = _drain_messages(bridge)
+    assert msgs[0]["payload"]["error"]
+    assert msgs[0]["payload"]["chartType"] == "minute"
+    assert bridge.chart_mode == "kline"
+    assert bridge._last_minute_bars == []
+
+
+def test_close_minute_returns_to_kline_fetch():
+    bridge = _bare_bridge()
+    root = NoopRoot()
+    bridge._root = root
+    bridge.replay = hqchart_bridge.ReplayDriver(
+        root, bridge._render_replay, on_state=bridge._on_replay_state)
+    bridge.chart_mode = "minute"
+    bridge._last_minute_bars = _minute_bars(3)
+    bridge._loading = False
+    fetched = []
+    bridge.fetch = lambda period=None, count=None: fetched.append(period)
+
+    bridge.close_minute()
+
+    assert bridge.chart_mode == "kline"
+    assert bridge._last_minute_bars == []
+    assert fetched == ["daily"]
+
+
+def test_fetch_from_minute_mode_resets_to_kline():
+    """分时模式下点周期/刷新：fetch 把模式复位成 kline，再取 K线"""
+    bridge = _bare_bridge()
+    root = NoopRoot()
+    bridge._root = root
+    bridge.replay = hqchart_bridge.ReplayDriver(
+        root, bridge._render_replay, on_state=bridge._on_replay_state)
+    bridge.chart_mode = "minute"
+    bridge._last_minute_bars = _minute_bars(3)
+    bridge._loading = False
+    bridge._fetch_thread = lambda count: None      # 挡住后台线程
+    bridge.fetch(period="weekly")
+
+    assert bridge.chart_mode == "kline"
+    assert bridge._last_minute_bars == []
+    assert bridge.period == "weekly"
+
+
+def test_dispatch_minute_open_and_close():
+    root = FakeRoot()
+    bridge = _bridge_for_dispatch(root)
+    calls = []
+    bridge.open_minute = lambda date="": calls.append(("open", date))
+    bridge.close_minute = lambda: calls.append(("close",))
+
+    bridge._dispatch({"event": "minute_open", "date": "2026-10-23"})
+    bridge._dispatch({"event": "minute_close"})
+
+    assert calls == [("open", "2026-10-23"), ("close",)]
+    assert root.calls and all(c[0] == 0 for c in root.calls)
+
+
+# ──────────────── 分时回放 ────────────────
+
+def _minute_replay_bridge(n=10):
+    """分时模式的回放桥：mode=minute，bars 已就位"""
+    bridge, root = _replay_bridge(n)
+    bridge.chart_mode = "minute"
+    bridge._last_minute_bars = _minute_bars(n)
+    bridge._minute_date = "2026-10-23"
+    bridge._minute_pre_close = 9.55
+    bridge._minute_klt = 1
+    return bridge, root
+
+
+def test_start_replay_minute_uses_minute_bounds():
+    bridge, root = _minute_replay_bridge(10)
+
+    bridge.start_replay(2000, None)          # 分时区间上限只有 1000
+
+    assert bridge.replay.running is True
+    assert bridge.replay.interval == hqchart_bridge.MINUTE_MAX_INTERVAL
+    assert bridge.replay.session.count == hqchart_bridge.MINUTE_DEFAULT_START_COUNT
+    assert bridge.replay.session.total == 10
+
+
+def test_start_replay_minute_waits_for_data():
+    bridge, root = _replay_bridge(10)
+    bridge.chart_mode = "minute"
+    bridge._last_minute_bars = []
+
+    bridge.start_replay(80, None)
+
+    assert bridge.replay.session is None
+
+
+def test_send_minute_frame_slices_and_attaches_metadata():
+    bridge, root = _minute_replay_bridge(10)
+    bridge.start_replay(80, None)
+    _drain_messages(bridge)
+
+    root.fire_next()                          # 8 → 9
+
+    msgs = _drain_messages(bridge)
+    assert len(msgs) == 1
+    payload = msgs[0]["payload"]
+    assert payload["replay"] is True
+    assert payload["replayCount"] == 9
+    assert payload["replayTotal"] == 10
+    assert payload["replayDate"] == "2026-10-23"
+    assert payload["replayTime"] == "09:38"
+    assert len(payload["items"]) == 9
+
+
+def test_minute_replay_state_includes_time():
+    bridge, root = _minute_replay_bridge(10)
+    bridge.start_replay(80, None)
+    _drain_messages(bridge)
+    root.fire_next()
+    _drain_messages(bridge)                    # 清掉推进的那一帧
+
+    bridge.replay.pause()
+    msgs = _drain_messages(bridge)
+    assert msgs[0]["cmd"] == "replay_state"
+    assert msgs[0]["state"] == "paused"
+    assert msgs[0]["date"] == "2026-10-23"
+    assert msgs[0]["time"] == "09:38"
+
+
+def test_minute_stop_replays_full_data():
+    bridge, root = _minute_replay_bridge(10)
+    bridge.start_replay(80, None)
+    _drain_messages(bridge)
+
+    bridge.stop_replay()
+    msgs = _drain_messages(bridge)
+    # 复位状态 + 一帧完整分时数据（replay=True，count=total）
+    assert [m["cmd"] for m in msgs] == ["replay_state", "data"]
+    assert msgs[0]["state"] == "idle"
+    assert msgs[1]["payload"]["replay"] is True
+    assert msgs[1]["payload"]["replayCount"] == 10
+    assert msgs[1]["payload"]["replayTotal"] == 10
+    assert len(msgs[1]["payload"]["items"]) == 10
+    assert bridge.replay.state == "idle"
+
+
+def test_set_replay_interval_minute_clamps_to_minute_bounds():
+    bridge, root = _minute_replay_bridge(10)
+
+    bridge.set_replay_interval(200000)
+    assert bridge.replay.interval == hqchart_bridge.MINUTE_MAX_INTERVAL
+
+    bridge.set_replay_interval("垃圾")
+    assert bridge.replay.interval == hqchart_bridge.MINUTE_DEFAULT_INTERVAL
+
+
+def test_minute_replay_still_uses_shared_driver():
+    """分时回放和 K线回放共用同一个 ReplayDriver，只是收敛区间不同"""
+    bridge, root = _replay_bridge(10)
+    assert bridge.replay.bounds == hqchart_bridge.interval_bounds("kline")
+
+    bridge.chart_mode = "minute"
+    bridge._last_minute_bars = _minute_bars(10)
+    bridge.start_replay(2000, None)
+
+    assert bridge.replay.bounds == hqchart_bridge.interval_bounds("minute")
 

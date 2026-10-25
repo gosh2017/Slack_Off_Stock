@@ -38,10 +38,12 @@ import threading
 from pathlib import Path
 
 from stock_monitor.stock_api import query_kline_data
+from stock_monitor.minute_api import query_minute_data
 from stock_monitor.replay import (
-    ReplaySession, ReplayDriver,
-    replay_count, clamp_interval,
-    DEFAULT_INTERVAL,
+    ReplaySession, ReplayDriver, new_session,
+    replay_count, clamp_interval, interval_bounds,
+    DEFAULT_INTERVAL, MINUTE_MAX_INTERVAL, MINUTE_DEFAULT_INTERVAL,
+    MINUTE_DEFAULT_START_COUNT,
 )
 
 # ──────────────── 可选依赖：pywebview ────────────────
@@ -223,6 +225,66 @@ def build_chart_payload(code: str, stock_type: str, name: str,
     }
 
 
+def build_minute_payload(code: str, stock_type: str, name: str,
+                         date: str, pre_close: float, bars: list,
+                         klt: int = 1, replay: bool = False,
+                         count: int = 0, total: int = 0,
+                         state: str = "", time_: str = "",
+                         note: str = "") -> dict:
+    """把 query_minute_data 的结果转成 HQChart 需要的一次分时载荷。
+
+    纯函数，便于单元测试。chartType="minute" 是 JS 侧区分分时/K线两种图的开关。
+
+    参数：
+        date:     实际取到的交易日（休市日会自动回退）
+        pre_close:前一交易日收盘价，分时图的基准线
+        bars:     query_minute_data 返回的 bars（含 av_price 等派生字段）
+        klt:      分钟粒度（1 / 5 / 15）
+        replay:   是否回放帧；回放时附带进度元数据，JS 就地重画 + 更新进度
+        note:     状态栏提示（休市日回退说明、走了新浪兜底源等）
+    """
+    symbol = "CN.%s" % code
+
+    items = []
+    for b in (bars or []):
+        if not isinstance(b, dict):
+            continue
+        items.append({
+            "date":    b.get("date", ""),
+            "time":    b.get("time", ""),
+            "open":    float(b.get("open", 0) or 0),
+            "high":    float(b.get("high", 0) or 0),
+            "low":     float(b.get("low", 0) or 0),
+            "close":   float(b.get("close", 0) or 0),
+            "volume":  int(b.get("volume", 0) or 0),
+            "amount":  float(b.get("amount", 0) or 0),
+            "avPrice": float(b.get("av_price", 0) or 0),
+        })
+
+    payload = {
+        "code":       code,
+        "stockType":  stock_type,
+        "name":       name or "",
+        "symbol":     symbol,
+        "chartType":  "minute",
+        "period":     "minute",
+        "date":       date or "",
+        "preClose":   float(pre_close or 0),
+        "klt":        klt,
+        "note":       note or "",
+        "items":      items,
+    }
+
+    if replay:
+        payload["replay"] = True
+        payload["replayCount"] = count
+        payload["replayTotal"] = total
+        payload["replayDate"] = date or ""
+        payload["replayTime"] = time_ or ""
+        payload["replayState"] = state or "running"
+    return payload
+
+
 # ──────────────── K线窗口（HQChart 后端） ────────────────
 
 class HqChartKlineWindow:
@@ -271,6 +333,15 @@ class HqChartKlineWindow:
             self._root, self._render_replay, on_state=self._on_replay_state,
             interval=DEFAULT_INTERVAL,
         )
+
+        # ── 分时模式 ──
+        # 一张窗口可以看 K线，也可以看某一天的分时。分时数据走东方财富接口
+        # （新浪不提供按日期回溯），完整 bars 留在本地，回放同样是画前 N 根。
+        self.chart_mode = "kline"     # "kline" | "minute"
+        self._minute_date = ""        # 当前分时数据对应日期
+        self._minute_klt = 1          # 分钟粒度
+        self._minute_pre_close = 0.0  # 分时基准线
+        self._last_minute_bars = []   # 最近一次取到的完整分时 bars（未切片）
 
         self.proc = self._spawn()
         threading.Thread(target=self._reader, daemon=True).start()
@@ -351,6 +422,10 @@ class HqChartKlineWindow:
             self._root.after(0, self.stop_replay)
         elif event == "replay_speed":
             self._root.after(0, self.set_replay_interval, msg.get("interval"))
+        elif event == "minute_open":
+            self._root.after(0, self.open_minute, msg.get("date", ""))
+        elif event == "minute_close":
+            self._root.after(0, self.close_minute)
         elif event == "chart_error":
             self._root.after(0, self._on_chart_error, msg.get("message", ""))
         elif event == "error":
@@ -419,8 +494,12 @@ class HqChartKlineWindow:
     # ── 子进程事件处理（均在 tkinter 主线程执行） ──
 
     def _on_period_event(self, period: str):
-        """用户在页面上切换了周期"""
-        if period != self.period:
+        """用户在页面上切换了周期。
+
+        分时模式下点周期按钮等于"返回K线再看这个周期"——哪怕周期没变也要
+        重新取数，fetch() 会把 chart_mode 复位成 kline。
+        """
+        if period != self.period or self.chart_mode == "minute":
             self.fetch(period)
 
     def _on_chart_error(self, message: str):
@@ -455,7 +534,9 @@ class HqChartKlineWindow:
         """
         if period:
             self.period = period
-        # 换周期 / 手动刷新都会整图重画，进行中的回放先退出
+        # 切周期 / 刷新 / 从分时返回 都会整图重画：先退出分时模式和进行中的回放
+        self.chart_mode = "kline"
+        self._last_minute_bars = []
         if self.replay.active:
             self.replay.stop(render_all=False)
         if self._loading:
@@ -465,6 +546,60 @@ class HqChartKlineWindow:
             self.period, PERIOD_COUNT_MAP[DEFAULT_PERIOD])
         threading.Thread(target=self._fetch_thread, args=(want,),
                          daemon=True).start()
+
+    # ── 分时数据 ──
+
+    def open_minute(self, date: str = ""):
+        """切到分时模式：拉指定交易日的分钟数据并显示（HQChart 画分时图）"""
+        if self._loading:
+            return
+        # 从分时切走 / 重新打开时先把旧的收干净
+        if self.replay.active:
+            self.replay.stop(render_all=False)
+        self.chart_mode = "minute"
+        self._last_klines = []
+        self._loading = True
+        threading.Thread(target=self._minute_fetch_thread,
+                         args=(date or "",), daemon=True).start()
+
+    def _minute_fetch_thread(self, date: str):
+        result = query_minute_data(self.code, self.stock_type, date)
+        self._root.after(0, self._on_minute_data_ready, result)
+
+    def _on_minute_data_ready(self, result: dict):
+        self._loading = False
+        if not isinstance(result, dict):
+            return
+        if self.chart_mode != "minute":
+            # 等数据期间用户切了周期 / 刷新：这次分时结果作废，把 K线请求补上
+            self.fetch(self.period)
+            return
+        payload = build_minute_payload(self.code, self.stock_type, self.name,
+                                       result.get("date", ""),
+                                       result.get("pre_close", 0.0),
+                                       result.get("bars", []),
+                                       klt=result.get("klt", 1),
+                                       note=result.get("note", ""))
+        if result.get("error"):
+            payload["error"] = result["error"]
+            self._send({"cmd": "data", "payload": payload})
+            self.chart_mode = "kline"
+            return
+        self._minute_date = result.get("date", "")
+        self._minute_klt = result.get("klt", 1)
+        self._minute_pre_close = result.get("pre_close", 0.0)
+        self._last_minute_bars = result.get("bars", [])
+        self._send({"cmd": "data", "payload": payload})
+
+    def close_minute(self):
+        """退出分时模式，回到当前周期的 K 线"""
+        if self.replay.active:
+            self.replay.stop(render_all=False)
+        self.chart_mode = "kline"
+        self._last_minute_bars = []
+        if self._loading:
+            return
+        self.fetch(self.period)
 
     def _fetch_thread(self, count: int):
         result = query_kline_data(self.code, self.stock_type,
@@ -503,14 +638,26 @@ class HqChartKlineWindow:
     def start_replay(self, interval=None, klines=None):
         """从最早的 bar 开始回放，一直播到最新一根。
 
-        平时看盘只要最近 120 根，回放要从最左边播起来，所以先多要一批历史
-        再开播。已经拿到数据（klines 不为空）时直接开播，省掉一次网络往返。
+        分时模式下回放当天：数据在 open_minute() 时已经拉好，直接开播，
+        间隔和第一帧起步 bar 数都按分时的参数（比日K快一个量级）。
+        K线模式走老逻辑：先多要一批历史再开播。
         """
+        if self._loading:
+            return
+        if self.chart_mode == "minute":
+            if not self._last_minute_bars:
+                return
+            bounds = interval_bounds("minute")
+            self._replay_interval = clamp_interval(interval, *bounds)
+            self.replay.set_bounds(bounds)
+            self.replay.set_interval(self._replay_interval)
+            session = new_session(len(self._last_minute_bars), "minute")
+            self.replay.start(session, self._replay_interval)
+            return
+
         # 请求还在飞的时候点了"回放"就先放着：否则它记着"想回放"，
         # 等这批普通请求回来时会用普通的 120 根开播，而不是回放该有的 500 根。
         # 和 matplotlib 那版（gui.KlineWindow.start_replay）保持一致。
-        if self._loading:
-            return
         self._replay_interval = clamp_interval(interval)
         if klines is None:
             self._replay_wanted = True
@@ -542,8 +689,14 @@ class HqChartKlineWindow:
         self.replay.stop(render_all=render_all)
 
     def set_replay_interval(self, ms):
-        """调整播放速度"""
-        self._replay_interval = clamp_interval(ms)
+        """调整播放速度（按当前图形类型收敛区间）"""
+        if self.chart_mode == "minute":
+            bounds = interval_bounds("minute")
+            self._replay_interval = clamp_interval(ms, *bounds)
+            self.replay.set_bounds(bounds)      # 驱动自己的收敛区间也要跟着切
+        else:
+            self._replay_interval = clamp_interval(ms)
+            self.replay.set_bounds(interval_bounds("kline"))
         self.replay.set_interval(ms)
 
     def _shutdown_replay(self):
@@ -555,8 +708,12 @@ class HqChartKlineWindow:
     def _render_replay(self, count: int):
         """回放每推进一步：把前 count 根推给子进程重画。
 
-        进度归零（stop 之后回调）时发一份完整载荷，让图表退出回放模式。
+        分时模式推分时帧；K线模式推 K线帧。进度归零（stop 之后回调）时发
+        完整数据，让图表退出回放模式。
         """
+        if self.chart_mode == "minute":
+            self._send_minute_frame(count, "idle")
+            return
         klines = self._last_klines
         if not klines:
             return
@@ -565,6 +722,20 @@ class HqChartKlineWindow:
                 self.code, self.stock_type, self.name, self.period, klines)})
             return
         self._send_replay_payload(self.replay.session.count, self.replay.state)
+
+    def _send_minute_frame(self, count: int, state: str):
+        """推送"揭示前 count 根"的分时回放帧"""
+        bars = self._last_minute_bars
+        if not bars:
+            return
+        count = max(1, min(count, len(bars)))
+        sliced = bars[:count]
+        payload = build_minute_payload(
+            self.code, self.stock_type, self.name, self._minute_date,
+            self._minute_pre_close, sliced, klt=self._minute_klt,
+            replay=True, count=count, total=len(bars),
+            state=state, time_=sliced[-1].get("time", ""))
+        self._send({"cmd": "data", "payload": payload})
 
     def _send_replay_payload(self, count: int, state: str):
         """推送"揭示前 count 根"的回放载荷"""
@@ -581,6 +752,21 @@ class HqChartKlineWindow:
 
     def _on_replay_state(self, state: str, session):
         """回放状态变了（暂停/继续/结束）：只同步状态，不重画图表"""
+        if self.chart_mode == "minute":
+            bars = self._last_minute_bars
+            if not bars:
+                return
+            if session is None:
+                self._send({"cmd": "replay_state", "state": state,
+                            "count": 0, "total": 0,
+                            "date": self._minute_date, "time": ""})
+                return
+            count = max(1, min(session.count, len(bars)))
+            self._send({"cmd": "replay_state", "state": state,
+                        "count": count, "total": len(bars),
+                        "date": self._minute_date,
+                        "time": bars[count - 1].get("time", "")})
+            return
         if not self._last_klines:
             return
         if session is None:

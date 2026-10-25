@@ -8,11 +8,14 @@
 <link rel="stylesheet" href="./app.css">
 </head>
 <body>
-    <!-- 顶部工具栏：周期切换 / 刷新 / 历史回放，样式与 tkinter 主窗口保持一致 -->
+    <!-- 顶部工具栏：周期切换 / 刷新 / 分时 / 历史回放，样式与 tkinter 主窗口保持一致 -->
     <div id="toolbar">
         <span id="title">--</span>
         <span id="status"></span>
         <span class="spacer"></span>
+        <input type="text" id="inp-date" class="tb-date"
+               placeholder="YYYY-MM-DD" title="分时日期，留空为今天">
+        <button class="tb-btn" id="btn-minute">分时</button>
         <button class="tb-btn active" data-period="daily" id="btn-daily">日K</button>
         <button class="tb-btn" data-period="weekly" id="btn-weekly">周K</button>
         <button class="tb-btn" data-period="monthly" id="btn-monthly">月K</button>

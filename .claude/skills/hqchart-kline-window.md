@@ -314,6 +314,8 @@ args = [
 | 图表一直等到超时 | pywebview 在**页面加载完成后**才注入 `window.pywebview.api`，而 `DOMContentLoaded` 时 `notify()` 已跑过一遍，事件被静默丢弃 | JS 侧入队 + 200ms 轮询补发 + 超时上限（见上文就绪握手） |
 | 数据推了但图是空的 | `evaluate_js` 推给了尚未定义的 `applyPayload` | Python 侧 `chart_ready` 之前缓冲，只保留最新一份载荷 |
 | 只有第一根 K 线 / 日期错乱 | `Open` 是字符串被整行丢弃；日期没转成 `YYYYMMDD` 整数 | 数据适配层统一转数字 / 转整数 |
+| 分时图不显示 / X 轴错位 | 用了 `"历史K线图"` 的 Type，或分时 `time` 传了字符串 | 分时图必须 `Type: "分钟走势图"`，`minute[].time` 是 HHMM 整数、`date` 是 YYYYMMDD 整数，数据格式 `stock[0].minute`（见本仓库 `assets/hqchart/README.md` 的「分时图」节） |
+| 分时回放速度还是日K的 400ms | 下拉框发的是写死的日K毫秒数 | 切图形时用 `syncSpeedSelect()` 换下拉框的 `value`（分时 500/200/80/30），Python 侧按 `interval_bounds("minute")` 收敛 |
 | 切换周期后指标错乱 | 复用同一个 chart 实例，残留上一周期的指标与坐标 | 整体重建（清容器再 `JSChart.Init`） |
 | `OSError: [Errno 22] Invalid argument` | 子进程退出后父进程不关管道，解释器退出时去关已经失效的描述符 | 退出时显式 close stdin/stdout/stderr 临时文件（与写入共用一把锁） |
 | 退出回调里调 messagebox 崩溃 | tkinter 不是线程安全的，退出回调在读取线程里 | 统一 `self._root.after(0, handler)` 调度回主线程 |
@@ -341,6 +343,7 @@ args = [
 - [ ] `assets/hqchart/`：`index.html` / `app.css` / `chart_bridge.js` / `hqchart/`（官方三个 JS + NOTICE）/ `README.md`
 - [ ] 入口分发：打包后用参数区分图表进程，开发环境用 `-m`
 - [ ] 两种后端同一套接口（`alive` / `activate` / `close` / `fetch`）
+- [ ] 指定日期分时：`chartType:"minute"` 分流、`Type:"分钟走势图"`、`time` 用 HHMM 整数、09:30 合成点对齐 X 轴、速度档位随图形切换
 - [ ] 主窗口关闭时收尾子进程，不留孤儿进程和管道噪声
 - [ ] `LICENSE` / `NOTICE` + 第三方许可证随产物分发
 - [ ] 打包脚本把 assets 打进正确的包内路径，并实测产物没有静默降级

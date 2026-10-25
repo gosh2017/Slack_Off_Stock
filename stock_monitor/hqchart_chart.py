@@ -11,7 +11,8 @@ HQChart K线窗口 — 承载进程
 
 通信协议（JSON 行，UTF-8）：
     父 → 子：
-        {"cmd": "data", "payload": {...}}       推送一份 K 线数据
+        {"cmd": "data", "payload": {...}}       推送一份 K 线 / 分时数据
+                                               （分时载荷带 chartType="minute"）
         {"cmd": "replay_state", ...}           推送回放状态（不重画图表）
         {"cmd": "focus"}                       请求把窗口提到前台
         {"cmd": "close"}                       关闭窗口
@@ -21,6 +22,8 @@ HQChart K线窗口 — 承载进程
         {"event": "chart_error", "message"} 图表初始化或数据写入失败
         {"event": "period", "period"}       用户切换了周期
         {"event": "refresh"}                用户点了刷新
+        {"event": "minute_open", "date"}    用户打开某天的分时
+        {"event": "minute_close"}           用户退出分时
         {"event": "close"}                  用户关闭了窗口
         {"event": "error", "message"}       本进程发生未捕获异常
 

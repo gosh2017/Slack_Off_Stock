@@ -45,7 +45,8 @@
     var STATE = {
         chart: null,      // JSChart 实例
         period: "daily",
-        symbol: ""
+        symbol: "",
+        chartType: "kline"   // "kline" | "minute"（同一窗口两种图）
     };
 
     // 回放状态。定拍在 Python 侧（每隔一段时间推来"前 N 根"的数据），
@@ -156,13 +157,65 @@
         }
     }
 
+    /** 分时模式没有"当前周期"，清掉周期按钮的高亮 */
+    function clearActiveButton() {
+        var btns = document.querySelectorAll(".tb-btn[data-period]");
+        for (var i = 0; i < btns.length; i++) {
+            btns[i].classList.remove("active");
+        }
+    }
+
+    /** 分时模式下禁掉日期输入框和「分时」按钮（得先退出分时才能再开） */
+    function syncMinuteControls() {
+        var inp = document.getElementById("inp-date");
+        var btn = document.getElementById("btn-minute");
+        var disabled = (STATE.chartType === "minute");
+        if (inp) { inp.disabled = disabled; }
+        if (btn) { btn.disabled = disabled; }
+    }
+
     // ════════════════ 回放工具栏 ════════════════
+
+    // 速度下拉框的值随图形类型切换：分时一天两百多根，要比日K快一个量级。
+    // 下拉框直接发毫秒数给 Python，所以切图时要把 option 的 value 一起换掉，
+    // 否则分时模式会收到日K的 400ms（那是日K的"快"）。
+    var SPEED_VALUES = {
+        kline:  [2000, 1000, 400, 150],
+        minute: [500, 200, 80, 30]
+    };
 
     /** 读速度下拉框（毫秒/根），取不到时用默认值 */
     function getReplaySpeed() {
         var sel = document.getElementById("sel-speed");
         var v = sel ? parseInt(sel.value, 10) : 400;
         return (isFinite(v) && v > 0) ? v : 400;
+    }
+
+    /** 按当前图形类型更新速度下拉框的毫秒值，保住当前选中的档位（慢/中/快/极快） */
+    function syncSpeedSelect() {
+        var sel = document.getElementById("sel-speed");
+        if (!sel) {
+            return;
+        }
+        var values = SPEED_VALUES[STATE.chartType] || SPEED_VALUES.kline;
+        var currentLabel = null;
+        for (var i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].selected) {
+                currentLabel = sel.options[i].text;
+                break;
+            }
+        }
+        for (var j = 0; j < sel.options.length && j < values.length; j++) {
+            sel.options[j].value = values[j];
+        }
+        if (currentLabel) {
+            for (var k = 0; k < sel.options.length; k++) {
+                if (sel.options[k].text === currentLabel) {
+                    sel.selectedIndex = k;
+                    break;
+                }
+            }
+        }
     }
 
     /** 回放进度文案 */
@@ -214,6 +267,7 @@
     function releaseButtons() {
         setButtonsDisabled(false);
         syncReplayButtons(REPLAY.state);
+        syncMinuteControls();
     }
 
     function bindToolbar() {
@@ -221,7 +275,8 @@
         for (var i = 0; i < btns.length; i++) {
             btns[i].addEventListener("click", function () {
                 var period = this.getAttribute("data-period");
-                if (period === STATE.period) {
+                // 分时模式下点周期按钮：交给 Python 退出分时再取该周期
+                if (period === STATE.period && STATE.chartType !== "minute") {
                     return;
                 }
                 setButtonsDisabled(true);
@@ -233,6 +288,31 @@
             refresh.addEventListener("click", function () {
                 setButtonsDisabled(true);
                 notify("refresh", {});
+            });
+        }
+
+        // ── 分时 ──
+        // 输入日期后点「分时」或按回车 → 打开那天的分时。日期留空就用"今天"，
+        // Python 侧对休市日会自动回退到最近交易日并在状态栏说明。
+        var minuteBtn = document.getElementById("btn-minute");
+        var dateInput = document.getElementById("inp-date");
+        if (minuteBtn) {
+            minuteBtn.addEventListener("click", function () {
+                if (minuteBtn.disabled) {
+                    return;
+                }
+                var date = dateInput ? dateInput.value.trim() : "";
+                setButtonsDisabled(true);
+                notify("minute_open", { date: date });
+            });
+        }
+        if (dateInput) {
+            dateInput.addEventListener("keydown", function (e) {
+                if (e.key !== "Enter" || dateInput.disabled) {
+                    return;
+                }
+                setButtonsDisabled(true);
+                notify("minute_open", { date: dateInput.value.trim() });
             });
         }
 
@@ -381,6 +461,180 @@
                    : "SH";
         }
         return c + "." + suffix;
+    }
+
+    // ════════════════ 分时数据适配 ════════════════
+
+    /** "09:31" → 931（HQChart 的分钟 Time 用 HHMM 整数，见 UpdateLastPoint） */
+    function hhmmToInt(time) {
+        var m = String(time == null ? "" : time).match(/^(\d{1,2}):(\d{2})$/);
+        if (!m) {
+            return 0;
+        }
+        return parseInt(m[1], 10) * 100 + parseInt(m[2], 10);
+    }
+
+    /**
+     * 把 Python 的分时 bars 转成 HQChart 单日分时的 stock 对象。
+     *
+     * 字段格式对应 MinuteChartContainer.JsonDataToMinuteData()：
+     *   minute[i] = { price, open, high, low, vol, amount, avprice, time }
+     *   time 是 HHMM 整数；date 是 YYYYMMDD 整数。
+     *
+     * X 轴的 0 号槽位刻着 "09:30"，而行情源的第一根是 09:31（时间和成交量
+     * 的口径见 minute_api.py 的模块头注释，几个源都一样），所以前面补一根
+     * 09:30 的合成点（用当天第一根的开盘价），让 09:31~15:00 正好落在
+     * 1..240 号槽位上。
+     */
+    function buildMinuteStock(payload) {
+        var items = payload.items || [];
+        var minute = [];
+        var firstOpen = 0;
+        for (var i = 0; i < items.length; i++) {
+            var b = items[i];
+            if (!b || typeof b !== "object") {
+                continue;
+            }
+            if (i === 0) {
+                firstOpen = num(b.open);
+            }
+            minute.push({
+                price: num(b.close),
+                open: num(b.open),
+                high: num(b.high),
+                low: num(b.low),
+                vol: num(b.volume),
+                amount: num(b.amount),
+                avprice: num(b.avPrice),
+                time: hhmmToInt(b.time)
+            });
+        }
+        if (!minute.length) {
+            return null;
+        }
+
+        var open = firstOpen || num(payload.preClose) || minute[0].open;
+        minute.unshift({
+            price: open, open: open, high: open, low: open,
+            vol: 0, amount: 0, avprice: open, time: 930
+        });
+
+        var high = open, low = open;
+        for (var j = 1; j < minute.length; j++) {
+            if (minute[j].high > high) { high = minute[j].high; }
+            if (minute[j].low > 0 && minute[j].low < low) { low = minute[j].low; }
+        }
+
+        return {
+            symbol: STATE.symbol,
+            name: payload.name || STATE.symbol,
+            date: toHqchartDate(payload.date),
+            yclose: num(payload.preClose),
+            high: high,
+            low: low,
+            IsHistoryMinute: true,          // 标题栏显示日期
+            minute: minute
+        };
+    }
+
+    /** 分时的 NetworkFilter：拦截单日分时请求，同步返回本地数据 */
+    function makeMinuteNetworkFilter(symbol, stock, name) {
+        return function (req, callback) {
+            req.PreventDefault = true;
+            if (req.Name === "MinuteChartContainer::RequestMinuteData") {
+                if (callback) {
+                    callback({
+                        dataType: 0,             // 全量数据（非增量）
+                        stock: [stock],
+                        AutoUpdate: false        // 数据由 Python 推送，不自动刷新
+                    });
+                }
+                return;
+            }
+            // 流通股本 / 信息地雷等附加数据本项目不提供
+        };
+    }
+
+    /** 分时图的 option：Type 必须是 "分钟走势图"（见 JSChart.SetOption） */
+    function buildMinuteOption(symbol, stock, name) {
+        return {
+            Type: "分钟走势图",
+
+            Symbol: symbol,
+            IsAutoUpdate: false,        // 数据由 Python 推送
+            IsApiPeriod: false,
+            EnableVerifyRecvData: false, // 数据是我们自己给的，不用校验 symbol
+
+            NetworkFilter: makeMinuteNetworkFilter(symbol, stock, name),
+
+            Minute: {
+                IsShowTooltip: false,
+                DragMode: 1
+            },
+
+            CorssCursorInfo: {
+                IsShowCorss: true,
+                DateFormatType: 0
+            },
+
+            EnableYDrag: { Right: true, Left: true },
+
+            Border: {
+                Left: 50, Right: 90, Bottom: 25, Top: 25,
+                AutoLeft: { Blank: 10, MinWidth: 60 },
+                AutoRight: { Blank: 5, MinWidth: 60 }
+            },
+
+            SplashTitle: "加载数据中……"
+        };
+    }
+
+    /** 创建分时图实例 */
+    function makeMinuteChart(symbol, stock, name) {
+        if (typeof JSChart === "undefined" ||
+            typeof JSChart.Init !== "function") {
+            return null;
+        }
+        var dom = document.getElementById("mainChart");
+        if (!dom) {
+            return null;
+        }
+        dom.innerHTML = "";
+        dom.style.display = "block";
+
+        applyStyle();
+        var chart = JSChart.Init(dom, false, true);
+        chart.SetOption(buildMinuteOption(symbol, stock, name));
+        return chart;
+    }
+
+    /** 复用现有实例重画分时（回放每帧都走这里，避免反复 Init） */
+    function renderMinuteRows(symbol, stock, name) {
+        if (!STATE.chart) {
+            var notice = document.getElementById("notice");
+            if (notice) {
+                notice.style.display = "none";
+            }
+            var chart = makeMinuteChart(symbol, stock, name);
+            if (!chart) {
+                return null;
+            }
+            STATE.chart = chart;
+            return chart;
+        }
+        try {
+            var updated = STATE.chart.SetOption(
+                buildMinuteOption(symbol, stock, name));
+            if (updated) {
+                return updated;
+            }
+        } catch (e) {
+            // 就地更新失败，落到整体重建兜底
+        }
+        destroyChart();
+        var rebuilt = makeMinuteChart(symbol, stock, name);
+        STATE.chart = rebuilt;
+        return rebuilt;
     }
 
     // ════════════════ 图表初始化 ════════════════
@@ -569,10 +823,12 @@
             return;
         }
 
+        STATE.chartType = "kline";
         STATE.period = payload.period || "daily";
         // payload.symbol 是 Python 侧的 "CN.600519" 形式，HQChart 不认，
         // 这里按代码 + 市场后缀重新生成
         STATE.symbol = toHqchartSymbol(payload.code, payload.stockType);
+        syncSpeedSelect();
 
         var rows = buildRows(items);
         if (!rows.length) {
@@ -644,6 +900,99 @@
         setReplayUI(state, count, total, REPLAY.date);
     }
 
+    /** 分时的标题：名称 + 日期 */
+    function setMinuteTitle(payload) {
+        var name = payload.name || payload.code || "";
+        var date = payload.date || "";
+        var text = name ? (name + " (" + payload.code + ")") : (payload.code || "--");
+        if (date) {
+            text += "  " + date;
+        }
+        var el = document.getElementById("title");
+        if (el) {
+            el.textContent = text;
+        }
+        document.title = "分时 — " + text;
+    }
+
+    /** 应用一份完整的分时数据：重建分时图 → 写入数据 */
+    function applyMinuteFull(payload) {
+        STATE.chartType = "minute";
+        STATE.period = "minute";
+        STATE.symbol = toHqchartSymbol(payload.code, payload.stockType);
+        syncSpeedSelect();
+
+        var stock = buildMinuteStock(payload);
+        if (!stock) {
+            setStatus("数据不足");
+            releaseButtons();
+            return;
+        }
+
+        destroyChart();
+        STATE.chart = null;
+
+        var chart = makeMinuteChart(STATE.symbol, stock,
+                                    payload.name || STATE.symbol);
+        if (!chart) {
+            return showChartMissing();
+        }
+        STATE.chart = chart;
+
+        REPLAY.state = "idle";
+        REPLAY.count = 0;
+        REPLAY.total = 0;
+        REPLAY.date = "";
+
+        setMinuteTitle(payload);
+        clearActiveButton();
+        releaseButtons();
+        setReplayUI("idle", 0, 0, "");
+        // setReplayUI 会写一次状态栏，所以提示语得排在它后面才能显示出来
+        // （休市日回退说明 / 走了新浪兜底源；回放帧会用进度文字覆盖）
+        if (payload.note) {
+            setStatus(payload.note);
+        }
+    }
+
+    /** 应用一帧分时回放：就地重画 + 更新进度，不重建实例 */
+    function applyMinuteReplay(payload) {
+        STATE.chartType = "minute";
+        STATE.period = "minute";
+        STATE.symbol = toHqchartSymbol(payload.code, payload.stockType);
+        syncSpeedSelect();
+
+        var stock = buildMinuteStock(payload);
+        if (!stock) {
+            setStatus("回放数据不足");
+            releaseButtons();
+            return;
+        }
+
+        var chart = renderMinuteRows(STATE.symbol, stock,
+                                     payload.name || STATE.symbol);
+        if (!chart) {
+            return showChartMissing();
+        }
+
+        var state = payload.replayState || "running";
+        var count = parseInt(payload.replayCount, 10);
+        var total = parseInt(payload.replayTotal, 10);
+        if (!isFinite(count) || count <= 0) { count = payload.items.length; }
+        if (!isFinite(total) || total <= 0) { total = payload.items.length; }
+
+        REPLAY.state = state;
+        REPLAY.count = count;
+        REPLAY.total = total;
+        REPLAY.date = (payload.replayDate || "") +
+                      (payload.replayTime ? " " + payload.replayTime : "");
+
+        setMinuteTitle(payload);
+        clearActiveButton();
+        releaseButtons();
+        setReplayUI(state, count, total, REPLAY.date);
+    }
+
     /**
      * 只更新回放状态（暂停 / 继续 / 结束），不动图表。
      * 由父进程在状态变化时单独推过来，省掉一次整图重画。
@@ -654,7 +1003,10 @@
         REPLAY.state = state;                          // 必须写回，否则按钮文案和状态会不同步
         if (typeof msg.count === "number") { REPLAY.count = msg.count; }
         if (typeof msg.total === "number") { REPLAY.total = msg.total; }
-        if (typeof msg.date === "string")  { REPLAY.date = msg.date; }
+        if (typeof msg.date === "string") {
+            REPLAY.date = msg.date + (typeof msg.time === "string" && msg.time
+                                      ? " " + msg.time : "");
+        }
         setReplayUI(state, REPLAY.count, REPLAY.total, REPLAY.date);
     }
 
@@ -673,6 +1025,14 @@
             releaseButtons();
             return;
         }
+        if (payload.chartType === "minute") {
+            if (payload.replay === true) {
+                applyMinuteReplay(payload);
+            } else {
+                applyMinuteFull(payload);
+            }
+            return;
+        }
         if (payload.replay === true) {
             applyReplay(payload);
             return;
@@ -686,6 +1046,8 @@
         bindToolbar();
         bindWindowResize();
         applyStyle();
+        syncSpeedSelect();               // 初始化速度下拉框（kline 档位）
+        syncMinuteControls();            // 初始化分时按钮状态
         setReplayUI("idle", 0, 0, "");   // 初始化回放按钮状态
 
         // chart_ready 的含义是"适配层可以接收 applyPayload"。

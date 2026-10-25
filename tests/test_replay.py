@@ -11,7 +11,12 @@ import pytest
 
 from stock_monitor.replay import (
     ReplaySession, ReplayDriver, replay_count, clamp_interval,
+    new_session, default_interval, interval_bounds, replay_start_count,
+    replay_speed_ms,
     DEFAULT_INTERVAL, MIN_INTERVAL, MAX_INTERVAL,
+    DEFAULT_START_COUNT,
+    MINUTE_DEFAULT_INTERVAL, MINUTE_MIN_INTERVAL, MINUTE_MAX_INTERVAL,
+    MINUTE_DEFAULT_START_COUNT, SPEED_LABELS,
     STATE_IDLE, STATE_RUNNING, STATE_PAUSED, STATE_FINISHED,
 )
 
@@ -385,3 +390,115 @@ def test_driver_construction_clamps_interval():
     driver, root, renders, states = _driver(None, interval=-999)
 
     assert driver.interval == MIN_INTERVAL
+
+
+# ──────────────── 分时回放参数 ────────────────
+
+def test_clamp_interval_accepts_custom_bounds():
+    assert clamp_interval(10, 20, 1000, 80) == 20
+    assert clamp_interval(5000, 20, 1000, 80) == 1000
+    assert clamp_interval(80, 20, 1000, 80) == 80
+    assert clamp_interval("垃圾", 20, 1000, 80) == 80
+
+
+def test_default_interval_by_chart_kind():
+    assert default_interval("kline") == DEFAULT_INTERVAL
+    assert default_interval("minute") == MINUTE_DEFAULT_INTERVAL
+    # 没听说过的类型按日K处理，不至于返回 None
+    assert default_interval("whatever") == DEFAULT_INTERVAL
+
+
+def test_interval_bounds_by_chart_kind():
+    assert interval_bounds("kline") == (MIN_INTERVAL, MAX_INTERVAL,
+                                        DEFAULT_INTERVAL)
+    assert interval_bounds("minute") == (MINUTE_MIN_INTERVAL,
+                                         MINUTE_MAX_INTERVAL,
+                                         MINUTE_DEFAULT_INTERVAL)
+
+
+def test_replay_start_count_by_chart_kind():
+    assert replay_start_count("kline") == DEFAULT_START_COUNT
+    # 分时一天两百多根，起步必须给多一些才看得出当天走势
+    assert replay_start_count("minute") > replay_start_count("kline")
+
+
+def test_replay_speed_ms_maps_each_label():
+    for label in SPEED_LABELS:
+        assert isinstance(replay_speed_ms("kline", label), int)
+        assert isinstance(replay_speed_ms("minute", label), int)
+
+
+def test_minute_speeds_are_faster_than_kline():
+    for label in SPEED_LABELS:
+        assert replay_speed_ms("minute", label) < replay_speed_ms("kline", label)
+
+
+def test_replay_speed_ms_unknown_label_falls_back():
+    assert replay_speed_ms("minute", "离谱") == MINUTE_DEFAULT_INTERVAL
+
+
+def test_new_session_uses_chart_specific_start_count():
+    assert new_session(100, "kline").count == DEFAULT_START_COUNT
+    assert new_session(100, "minute").count == MINUTE_DEFAULT_START_COUNT
+
+
+def test_new_session_clamps_start_count_to_total():
+    # 数据比起步数还少时不能越界
+    assert new_session(3, "minute").count == 3
+
+
+def test_new_session_accepts_explicit_start_count():
+    assert new_session(100, "minute", start_count=2).count == 2
+
+
+def test_session_stamp_at_combines_date_and_time():
+    bars = [{"date": "2026-10-23", "time": "09:31"},
+            {"date": "2026-10-23", "time": "09:32"}]
+    session = ReplaySession(total=2, start_count=1)
+
+    assert session.stamp_at(bars) == "2026-10-23 09:31"
+    session.count = 2
+    assert session.stamp_at(bars) == "2026-10-23 09:32"
+
+
+def test_session_stamp_at_dirty_input():
+    session = ReplaySession(total=1, start_count=1)
+
+    assert session.stamp_at([]) == ""
+    assert session.stamp_at([None, "bad"]) == ""
+    # 只有日期没有时间时退化成日期
+    assert session.stamp_at([{"date": "2026-10-23"}]) == "2026-10-23"
+    # 进度超出数据时也不该越界
+    session.count = 99
+    assert session.stamp_at([{"date": "2026-10-23"}]) == ""
+
+
+def test_driver_uses_minute_bounds_when_configured():
+    driver = _driver(None, bounds=interval_bounds("minute"), interval=5)[0]
+
+    assert driver.interval == MINUTE_MIN_INTERVAL   # 5 被抬到分时的下限
+
+    driver.set_interval(99999)                      # 高于分时的上限
+    assert driver.interval == MINUTE_MAX_INTERVAL
+
+    driver.set_interval("垃圾值")                    # 非法输入回落分时的默认值
+    assert driver.interval == MINUTE_DEFAULT_INTERVAL
+
+
+def test_driver_set_bounds_reclamps_the_interval():
+    """从日K切到分时：原来那个 2000 毫秒必须被重新收敛，否则一天要播 8 分钟"""
+    driver = _driver(None, interval=2000)[0]
+
+    driver.set_bounds(interval_bounds("minute"))
+
+    assert driver.interval == MINUTE_MAX_INTERVAL
+
+
+def test_driver_set_bounds_ignores_garbage():
+    driver = _driver(None, bounds=interval_bounds("minute"))[0]
+    before = driver.interval
+
+    driver.set_bounds(None)
+    driver.set_bounds(())
+
+    assert driver.interval == before
