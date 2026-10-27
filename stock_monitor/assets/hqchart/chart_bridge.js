@@ -474,6 +474,77 @@
         return parseInt(m[1], 10) * 100 + parseInt(m[2], 10);
     }
 
+    // ── 分时 X 轴槽位 ──
+    //
+    // HQChart 的沪深分时 X 轴是**固定 243 个槽位**，跟数据里有几根 bar 无关
+    // （见 umychart.js 的 MinuteCoordinateData.SHZE_MINUTE_X_COORDINATE 和
+    // MinuteTimeStringData.CreateSHSZData）：
+    //
+    //     槽位 0         = 09:25 集合竞价
+    //     槽位 1 ~ 121   = 09:30 ~ 11:30（上午 120 分钟）
+    //     槽位 122 ~ 242 = 13:00 ~ 15:00（下午 120 分钟，午休不占槽位）
+    //
+    // 而画图时用的是「数据数组下标」当 X 轴下标，不看 bar 自己的 time
+    // （ChartMinutePriceLine.Draw / ChartMinuteVolumBar.Draw 里的 j 直接喂给
+    // ChartFrame.GetXFromIndex）。所以每根 bar 必须放到它自己时间对应的槽位上，
+    // 中间的空槽位补占位点——1 分钟数据本来就连续填满，看不出差别；5 / 15 分钟
+    // 数据若照旧按到达顺序挤进数组开头，一整天就会被压缩到 X 轴最左边那一小段
+    // （48 根 5 分钟线只占 09:25~10:13），曲线和数据就对不上刻度了。
+
+    // 时间边界一律用「当天第几分钟」比较，别跟 HHMM 整数混着写
+    var MINUTE_CALL_AUCTION_TIME = 925;      // HHMM，只用于合成点的 time 字段
+    var MINUTE_CALL_AUCTION_SLOT = 0;
+    var MINUTE_AUCTION_MINUTES = 565;        // 09:25
+    var MINUTE_MORNING_MINUTES = 570;        // 09:30
+    var MINUTE_MORNING_END = 690;            // 11:30
+    var MINUTE_MORNING_SLOT_START = 1;
+    var MINUTE_AFTERNOON_MINUTES = 780;      // 13:00
+    var MINUTE_AFTERNOON_END = 900;          // 15:00
+    var MINUTE_AFTERNOON_SLOT_START =
+        MINUTE_MORNING_SLOT_START +
+        (MINUTE_MORNING_END - MINUTE_MORNING_MINUTES) + 1;         // 122
+
+    /**
+     * "09:31" → 分时 X 轴槽位下标；不是 HH:MM 或不在交易时段返回 -1。
+     *
+     * 直接收字符串：HHMM 整数是有歧义的（11:59 写成 1159 再除回分钟会变成
+     * 12:59），所以先把小时和分钟分开算成"当天第几分钟"再比。
+     */
+    function minuteSlotIndex(time) {
+        var m = String(time == null ? "" : time).match(/^(\d{1,2}):(\d{2})$/);
+        if (!m) {
+            return -1;
+        }
+        var minutes = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+        if (minutes < MINUTE_AUCTION_MINUTES || minutes > MINUTE_AFTERNOON_END) {
+            return -1;
+        }
+        if (minutes < MINUTE_MORNING_MINUTES) {
+            return MINUTE_CALL_AUCTION_SLOT;
+        }
+        if (minutes <= MINUTE_MORNING_END) {
+            return MINUTE_MORNING_SLOT_START + (minutes - MINUTE_MORNING_MINUTES);
+        }
+        if (minutes < MINUTE_AFTERNOON_MINUTES) {
+            return -1;                            // 午休 11:31 ~ 12:59
+        }
+        return MINUTE_AFTERNOON_SLOT_START + (minutes - MINUTE_AFTERNOON_MINUTES);
+    }
+
+    /** 槽位下标 → HHMM 整数（只给占位点填 time 用，保证提示里的时间读得通） */
+    function minuteSlotTime(slot) {
+        var minutes;
+        if (slot <= MINUTE_CALL_AUCTION_SLOT) {
+            return MINUTE_CALL_AUCTION_TIME;
+        }
+        if (slot < MINUTE_AFTERNOON_SLOT_START) {
+            minutes = MINUTE_MORNING_MINUTES + (slot - MINUTE_MORNING_SLOT_START);
+        } else {
+            minutes = MINUTE_AFTERNOON_MINUTES + (slot - MINUTE_AFTERNOON_SLOT_START);
+        }
+        return Math.floor(minutes / 60) * 100 + (minutes % 60);
+    }
+
     /**
      * 把 Python 的分时 bars 转成 HQChart 单日分时的 stock 对象。
      *
@@ -481,24 +552,44 @@
      *   minute[i] = { price, open, high, low, vol, amount, avprice, time }
      *   time 是 HHMM 整数；date 是 YYYYMMDD 整数。
      *
-     * X 轴的 0 号槽位刻着 "09:30"，而行情源的第一根是 09:31（时间和成交量
-     * 的口径见 minute_api.py 的模块头注释，几个源都一样），所以前面补一根
-     * 09:30 的合成点（用当天第一根的开盘价），让 09:31~15:00 正好落在
-     * 1..240 号槽位上。
+     * minute 数组按「下标对齐 X 轴槽位」来填（见上面的「分时 X 轴槽位」）：
+     * 真实数据落在它自己的槽位，中间的空档补占位点——占位点的 price / avprice
+     * 留空，库会用上一个点的值前向填充（JsonDataToMinuteData 里「当前没有价格
+     * 使用上一个价格填充」），vol 给 0，成交量柱子就不画（ChartMinuteVolumBar
+     * 里 !vol 直接跳过）。所以 5 / 15 分钟数据呈现为阶梯线，刻度对得上，
+     * 又不假装知道 bar 之间的价格。
+     *
+     * 数组截到最后一根真实数据所在的槽位：回放时右边留白，而不是拖出一条
+     * 撑到 15:00 的水平尾巴。
+     *
+     * 行情源的时间是这根 bar 的「结束时间」，第一根是 09:31 而不是 09:30
+     * （口径见 minute_api.py 的模块头注释），所以最左边的槽位补一根合成点
+     * （当天开盘价），否则 09:30 那一格是空的、线要从 09:31 才起。09:25 的
+     * 集合竞价价拿不到，也用开盘价顶——反正那个槽位就贴在 09:30 刻度旁边。
      */
     function buildMinuteStock(payload) {
         var items = payload.items || [];
-        var minute = [];
+        var bars = [];
         var firstOpen = 0;
+        var lastSlot = -1;
         for (var i = 0; i < items.length; i++) {
             var b = items[i];
             if (!b || typeof b !== "object") {
                 continue;
             }
-            if (i === 0) {
+            var slot = minuteSlotIndex(b.time);
+            if (slot < 0) {
+                continue;                          // 非交易时段的时间，画不进这张图
+            }
+            var time = hhmmToInt(b.time);
+            if (!bars.length) {
                 firstOpen = num(b.open);
             }
-            minute.push({
+            if (slot > lastSlot) {
+                lastSlot = slot;
+            }
+            bars.push({
+                slot: slot,
                 price: num(b.close),
                 open: num(b.open),
                 high: num(b.high),
@@ -506,23 +597,55 @@
                 vol: num(b.volume),
                 amount: num(b.amount),
                 avprice: num(b.avPrice),
-                time: hhmmToInt(b.time)
+                time: time
             });
         }
-        if (!minute.length) {
+        if (!bars.length || lastSlot < 0) {
             return null;
         }
 
-        var open = firstOpen || num(payload.preClose) || minute[0].open;
-        minute.unshift({
-            price: open, open: open, high: open, low: open,
-            vol: 0, amount: 0, avprice: open, time: 930
-        });
+        var open = firstOpen || num(payload.preClose) || bars[0].price;
+
+        var minute = [];
+        for (var slot = 0; slot <= lastSlot; slot++) {
+            minute[slot] = null;
+        }
+
+        for (var j = 0; j < bars.length; j++) {
+            var bar = bars[j];
+            if (minute[bar.slot]) {
+                continue;                          // 同一槽位重复的时间，保留先到的
+            }
+            minute[bar.slot] = {
+                price: bar.price, open: bar.open, high: bar.high,
+                low: bar.low, vol: bar.vol, amount: bar.amount,
+                avprice: bar.avprice, time: bar.time
+            };
+        }
+
+        if (!minute[MINUTE_CALL_AUCTION_SLOT]) {
+            minute[MINUTE_CALL_AUCTION_SLOT] = {
+                price: open, open: open, high: open, low: open,
+                vol: 0, amount: 0, avprice: open,
+                time: MINUTE_CALL_AUCTION_TIME
+            };
+        }
+
+        for (var slot = 0; slot <= lastSlot; slot++) {
+            if (minute[slot]) {
+                continue;
+            }
+            minute[slot] = {
+                price: null, open: null, high: null, low: null,
+                vol: 0, amount: 0, avprice: null,
+                time: minuteSlotTime(slot)
+            };
+        }
 
         var high = open, low = open;
-        for (var j = 1; j < minute.length; j++) {
-            if (minute[j].high > high) { high = minute[j].high; }
-            if (minute[j].low > 0 && minute[j].low < low) { low = minute[j].low; }
+        for (var j = 0; j < bars.length; j++) {
+            if (bars[j].high > high) { high = bars[j].high; }
+            if (bars[j].low > 0 && bars[j].low < low) { low = bars[j].low; }
         }
 
         return {
