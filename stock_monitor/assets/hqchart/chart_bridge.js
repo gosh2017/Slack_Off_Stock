@@ -697,6 +697,131 @@
         };
     }
 
+    // ── 分时买卖点标注（测试功能）──
+    //
+    // 库自带 ChartBuySell（umychart.js:51483）就是同花顺那种画法：B 画在该点
+    // 最低价之下、S 画在最高价之上。但它目前只被 K 线训练容器用过，分时容器没接。
+    // 挂上去的口子是 CreateChartPaintExtend（umychart.js:12343）——它会接好
+    // Canvas / ChartBorder / ChartFrame，而 ChartPaintEx[] 每帧都会被 Draw()
+    // （umychart.js:6767），且在价格线之后画，所以标记压在曲线上面。
+    //
+    // 两个必须绕开的坑：
+    //   · Data 要自己接。CreateChartPaintExtend 不接 Data，而 ChartBuySell.Draw
+    //     读的是 this.Data.Data[i].High / .Low。但分时图 ChartPaint[0].Data.Data
+    //     是纯收盘价数组（BindMainData 里 bindData.Data = minuteData.GetClose()，
+    //     umychart.js:100875），带 High/Low 的对象在 ChartPaint[0].Source.Data
+    //     （umychart.js:100886）。所以每次 Draw 都懒取一次 Source，回放换数据后
+    //     也能自愈。
+    //   · Key 是数据数组下标（ChartBuySell.Draw 里 var key = i），单日分时
+    //     DataOffset 恒为 0，所以 Key 就是上面 buildMinuteStock 的槽位下标——
+    //     同一套坐标，之前那个槽位修复对标记同样成立。
+    //
+    // 点击位置来自 ON_CLICK 事件（umychart.js:5591 ClickEvent）：库已经把鼠标 x
+    // 换算成帧内浮点下标塞进 data.Data.X，Math.round 就是槽位。
+
+    var MINUTE_MARK_CLICK_EVENT = 26;    // JSCHART_EVENT_ID.ON_CLICK
+    var MINUTE_MARK_HINT = "点击分时曲线标注买卖点（B / S 循环）";
+
+    // 当前那一个标记。slot < 0 表示还没点过
+    var MINUTE_MARK = { slot: -1, op: 0 };   // op: 0=买 1=卖
+
+    function clearMinuteMark() {
+        MINUTE_MARK.slot = -1;
+        MINUTE_MARK.op = 0;
+    }
+
+    /** 建买卖点画法；container 是 JSChart 实例上的 JSChartContainer */
+    function makeMinuteMarkPaint(container) {
+        if (typeof ChartBuySell !== "function") {
+            return null;
+        }
+        var paint = new ChartBuySell();
+        paint.IconFont = null;         // 不加载 iconfont，退回文字 B / S
+        // 同花顺配色：买 B 红、卖 S 绿（库默认是买绿 rgb(0,205,102) / 卖橙 rgb(255,127,36)）
+        paint.BuyIcon = { Color: "rgb(255,0,0)", Text: "B" };
+        paint.SellIcon = { Color: "rgb(0,150,0)", Text: "S" };
+        // 最后一点的箭头。0=画在最后一个数据上——我们的数组已经截到最后一根真实
+        // bar，所以它会自动跟着回放进度走，不用自己维护下标（用 1 就得填索引）
+        paint.LastDataDrawType = 0;
+        paint.LastDataIndex = -1;
+        // 库默认是 ⬇（U+2B07），字形较新、在加粗字体下容易缺字；▼ 是 U+25BC，覆盖更稳
+        paint.LastDataIcon = { Color: "rgb(0,0,205)", Text: "▼" };
+        var dpr = (typeof GetDevicePixelRatio === "function")
+            ? GetDevicePixelRatio() : 1;
+        paint.TextFont = "bold " + Math.round(14 * dpr) + "px arial";
+
+        var baseDraw = paint.Draw;
+        paint.Draw = function () {
+            var main = container.ChartPaint && container.ChartPaint[0];
+            paint.Data = main ? main.Source : null;
+            baseDraw.call(paint);
+        };
+        return paint;
+    }
+
+    /** 装买卖点画法 + 点击事件；每次 SetOption 都会新建容器，所以每次都重装 */
+    function installMinuteMark(chart) {
+        var container = chart && chart.JSChartContainer;
+        if (!container ||
+            typeof container.CreateChartPaintExtend !== "function") {
+            return null;
+        }
+        if (container.MinuteMarkPaint) {
+            return container.MinuteMarkPaint;
+        }
+        var paint = makeMinuteMarkPaint(container);
+        if (!paint || !container.CreateChartPaintExtend(paint, 0)) {
+            return null;
+        }
+        container.MinuteMarkPaint = paint;
+        container.AddEventCallback({
+            event: MINUTE_MARK_CLICK_EVENT,
+            callback: function (_evt, data, cont) {
+                onMinuteMarkClick(cont, data);
+            }
+        });
+        return paint;
+    }
+
+    /** 点击分时曲线：把标记移到该槽位并翻转 B/S */
+    function onMinuteMarkClick(container, data) {
+        var paint = container.MinuteMarkPaint;
+        var main = container.ChartPaint && container.ChartPaint[0];
+        var src = main && main.Source;
+        if (!paint || !src || !src.Data || !src.Data.length) {
+            return;
+        }
+        if (!data || !data.Data || typeof data.Data.X !== "number") {
+            return;                        // 点在绘图区外
+        }
+
+        var slot = Math.round(data.Data.X) + (src.DataOffset | 0);
+        if (slot < 0 || slot >= src.Data.length) {
+            return;
+        }
+
+        var first = MINUTE_MARK.slot < 0;
+        MINUTE_MARK.slot = slot;
+        MINUTE_MARK.op = first ? 0 : (MINUTE_MARK.op === 0 ? 1 : 0);
+
+        paint.ClearTradeData();
+        paint.AddTradeItem({ Key: MINUTE_MARK.slot, Op: MINUTE_MARK.op });
+        setStatus((MINUTE_MARK.op === 0 ? "买入" : "卖出") +
+                  "  " + hhmmToText(minuteSlotTime(MINUTE_MARK.slot)));
+        try {
+            container.Draw();
+        } catch (e) {
+            // 重画失败不致命，下次交互会再画
+        }
+    }
+
+    /** HHMM 整数 → "HH:MM" 文本（minuteSlotTime 的返回值） */
+    function hhmmToText(hhmm) {
+        var h = Math.floor(hhmm / 100);
+        var m = hhmm % 100;
+        return (h < 10 ? "0" + h : "" + h) + ":" + (m < 10 ? "0" + m : "" + m);
+    }
+
     /** 分时的 NetworkFilter：拦截单日分时请求，同步返回本地数据 */
     function makeMinuteNetworkFilter(symbol, stock, name) {
         return function (req, callback) {
@@ -765,6 +890,7 @@
         applyStyle();
         var chart = JSChart.Init(dom, false, true);
         chart.SetOption(buildMinuteOption(symbol, stock, name));
+        installMinuteMark(chart);
         return chart;
     }
 
@@ -786,6 +912,7 @@
             var updated = STATE.chart.SetOption(
                 buildMinuteOption(symbol, stock, name));
             if (updated) {
+                installMinuteMark(updated);
                 return updated;
             }
         } catch (e) {
@@ -990,6 +1117,20 @@
         STATE.symbol = toHqchartSymbol(payload.code, payload.stockType);
         syncSpeedSelect();
 
+        // 最新一个交易日 = 日K数据里最新的那根。升序排列时取最后一根即可，
+        // 但停牌股最后一根可能不是全市场最新交易日，所以取 max 更稳。
+        var latestDate = "";
+        for (var li = 0; li < items.length; li++) {
+            var ld = items[li] && items[li].date;
+            if (ld && ld > latestDate) {
+                latestDate = ld;
+            }
+        }
+        if (latestDate) {
+            STATE.latestDate = latestDate;
+            setDateInput(latestDate);
+        }
+
         var rows = buildRows(items);
         if (!rows.length) {
             setStatus("数据不足（日期格式无法解析）");
@@ -1089,6 +1230,9 @@
             return;
         }
 
+        // 新的一整天数据：清掉旧的买卖点标记
+        clearMinuteMark();
+
         destroyChart();
         STATE.chart = null;
 
@@ -1107,12 +1251,15 @@
         setMinuteTitle(payload);
         clearActiveButton();
         releaseButtons();
+        // 日期框显示当前查看的这天；若比已知最新交易日还新（K线数据
+        // 可能停在昨天），顺手把默认值也往前推
+        setDateInput(payload.date);
+        noteLatestDate(payload.date);
         setReplayUI("idle", 0, 0, "");
         // setReplayUI 会写一次状态栏，所以提示语得排在它后面才能显示出来
         // （休市日回退说明 / 走了新浪兜底源；回放帧会用进度文字覆盖）
-        if (payload.note) {
-            setStatus(payload.note);
-        }
+        setStatus(payload.note ? (payload.note + "  " + MINUTE_MARK_HINT)
+                               : MINUTE_MARK_HINT);
     }
 
     /** 应用一帧分时回放：就地重画 + 更新进度，不重建实例 */
