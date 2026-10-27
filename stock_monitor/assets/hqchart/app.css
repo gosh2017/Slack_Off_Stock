@@ -99,13 +99,15 @@ body {
     cursor: pointer;
 }
 
-/* 分时日期输入框，跟按钮一样的高度 */
+/* 分时日期选择框（原生 date 控件），跟按钮一样的高度。
+   原生控件自带日历图标和内部边距，宽度要比文本框宽一点才放得下
+   "YYYY-MM-DD" + 图标，padding 也交给浏览器默认即可。 */
 .tb-date {
     font-family: inherit;
     font-size: 12px;
-    padding: 3px 6px;
     height: 27px;
-    width: 110px;
+    width: 150px;
+    padding: 0 4px;
     background: #FFFFFF;
     color: #333;
     border: 1px solid #CCCCCC;

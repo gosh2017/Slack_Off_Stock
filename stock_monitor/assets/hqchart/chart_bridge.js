@@ -46,7 +46,8 @@
         chart: null,      // JSChart 实例
         period: "daily",
         symbol: "",
-        chartType: "kline"   // "kline" | "minute"（同一窗口两种图）
+        chartType: "kline",  // "kline" | "minute"（同一窗口两种图）
+        latestDate: ""       // 最新一个交易日（YYYY-MM-DD），分时日期框的默认值
     };
 
     // 回放状态。定拍在 Python 侧（每隔一段时间推来"前 N 根"的数据），
@@ -174,6 +175,42 @@
         if (btn) { btn.disabled = disabled; }
     }
 
+    // ── 分时日期选择框 ──
+    // 原生 date 控件的值是 "YYYY-MM-DD"（清空时为 ""）。默认显示最新一个
+    // 交易日：页面加载时先放"今天"，日K数据回来后更新成数据里最新的那天
+    // （休市日、停牌股都会落在最近一个真实交易日上）。
+
+    /** 今天的 YYYY-MM-DD（日期框的初始默认值） */
+    function todayStr() {
+        var d = new Date();
+        var m = d.getMonth() + 1;
+        return d.getFullYear() + "-" +
+               (m < 10 ? "0" + m : "" + m) + "-" +
+               (d.getDate() < 10 ? "0" + d.getDate() : "" + d.getDate());
+    }
+
+    /** 设置日期框的值（取不到控件或值非法时不动） */
+    function setDateInput(value) {
+        var inp = document.getElementById("inp-date");
+        if (inp && value) {
+            inp.value = value;
+        }
+    }
+
+    /** 更新"最新交易日"默认值：只在数据真的给出更晚日期时才更新 */
+    function noteLatestDate(value) {
+        if (value && value > STATE.latestDate) {
+            STATE.latestDate = value;
+            setDateInput(value);
+        }
+    }
+
+    /** 读日期框的值；清空时回退到默认的最新交易日 */
+    function getDateInput() {
+        var inp = document.getElementById("inp-date");
+        return (inp && inp.value.trim()) || STATE.latestDate || todayStr();
+    }
+
     // ════════════════ 回放工具栏 ════════════════
 
     // 速度下拉框的值随图形类型切换：分时一天两百多根，要比日K快一个量级。
@@ -292,7 +329,8 @@
         }
 
         // ── 分时 ──
-        // 输入日期后点「分时」或按回车 → 打开那天的分时。日期留空就用"今天"，
+        // 从日期选择框选好日期后点「分时」或按回车 → 打开那天的分时。
+        // 日期框默认就是最新交易日（见 getDateInput），清空了也会回退到它；
         // Python 侧对休市日会自动回退到最近交易日并在状态栏说明。
         var minuteBtn = document.getElementById("btn-minute");
         var dateInput = document.getElementById("inp-date");
@@ -301,9 +339,8 @@
                 if (minuteBtn.disabled) {
                     return;
                 }
-                var date = dateInput ? dateInput.value.trim() : "";
                 setButtonsDisabled(true);
-                notify("minute_open", { date: date });
+                notify("minute_open", { date: getDateInput() });
             });
         }
         if (dateInput) {
@@ -312,7 +349,7 @@
                     return;
                 }
                 setButtonsDisabled(true);
-                notify("minute_open", { date: dateInput.value.trim() });
+                notify("minute_open", { date: getDateInput() });
             });
         }
 
@@ -1171,6 +1208,9 @@
         applyStyle();
         syncSpeedSelect();               // 初始化速度下拉框（kline 档位）
         syncMinuteControls();            // 初始化分时按钮状态
+        // 日期框先放今天（日K数据回来后 applyFull 会更新成最新交易日）
+        STATE.latestDate = todayStr();
+        setDateInput(STATE.latestDate);
         setReplayUI("idle", 0, 0, "");   // 初始化回放按钮状态
 
         // chart_ready 的含义是"适配层可以接收 applyPayload"。
